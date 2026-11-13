@@ -1,0 +1,22 @@
+# 构建产物
+dist/
+*.zip
+launcher/Rhythm4K.exe
+launcher/*.pdb
+
+# 内置示例曲是第三方作品，不进仓库（避免版权问题）
+www/audio/
+
+# 本机运行时文件（快捷方式里是绝对路径，换机器失效）
+Rhythm4K.lnk
+launch.log
+check.txt
+
+# 开发时临时目录
+.verify/
+node_modules/
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store

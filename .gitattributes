@@ -1,0 +1,8 @@
+# 换行符：源文件统一 LF，但 Windows 脚本必须是 CRLF
+# （.bat 用 LF 会导致 cmd 解析异常，这是实际踩过的坑）
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.ico binary
+*.png binary
+*.zip binary
