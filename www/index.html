@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rhythm4K</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app">
+  <canvas id="scene"></canvas>
+  <div id="bootError" class="boot-error" hidden></div>
+
+  <div id="ui">
+    <!-- ============ 主菜单 ============ -->
+    <section id="screen-menu" class="screen">
+      <div class="card">
+        <h1>Rhythm<span class="accent">4K</span></h1>
+        <p class="sub">4 轨下落式 · 普通音符 + 长条 · 兼容 osu!mania 谱面 · 也能从一首歌自动生成</p>
+
+        <div id="drop" class="drop">
+          <p class="drop-title">把 <b>.osz</b> / <b>.osu</b> 或整个曲目文件夹拖到这里</p>
+          <p class="drop-sub">也可以直接选择</p>
+          <div class="btns">
+            <button id="btnFile" class="btn">选择 .osz / .osu</button>
+            <button id="btnDir" class="btn">选择文件夹</button>
+            <button id="btnDemo" class="btn btn-primary">内置示例曲</button>
+          </div>
+          <div class="btns auto-row">
+            <select id="autoDiffMenu" class="sel">
+              <option value="easy">简单</option>
+              <option value="normal" selected>普通</option>
+              <option value="hard">困难</option>
+            </select>
+            <button id="btnAuto" class="btn">从音乐自动生成谱面</button>
+          </div>
+        </div>
+
+        <div id="chartList" class="chart-list hidden"></div>
+        <p id="menuMsg" class="msg"></p>
+        <p class="hint">键位 <kbd>D</kbd><kbd>F</kbd><kbd>J</kbd><kbd>K</kbd> · <kbd>空格</kbd> 开始 · <kbd>Esc</kbd> 暂停 · <kbd>F11</kbd> 全屏</p>
+      </div>
+    </section>
+
+    <!-- ============ 准备开始 ============ -->
+    <section id="screen-ready" class="screen hidden">
+      <div class="card">
+        <p class="kicker">准备就绪</p>
+        <h2 id="readyTitle">—</h2>
+        <p id="readyMeta" class="sub">—</p>
+        <dl id="readyStats" class="stats"></dl>
+
+        <div class="settings">
+          <label>判定偏移 <input id="setOffset" type="number" step="1" min="-300" max="300"> ms</label>
+          <label>音符下落时长 <input id="setScroll" type="number" step="50" min="300" max="1600"> ms</label>
+          <label>背景暗度 <input id="setDim" type="range" min="0" max="95"></label>
+          <label>音量 <input id="setVolume" type="range" min="0" max="100"></label>
+          <button id="btnCalib" class="btn">延迟校准…</button>
+        </div>
+        <p class="hint">偏移：判定偏早调负、偏晚调正；通常 0 附近。改完自动保存。</p>
+
+        <div id="autoRow" class="settings hidden">
+          <label>自动谱面难度
+            <select id="autoDiffReady" class="sel">
+              <option value="easy">简单</option>
+              <option value="normal">普通</option>
+              <option value="hard">困难</option>
+            </select>
+          </label>
+          <button id="btnExport" class="btn">导出 .osu</button>
+          <button id="btnReport" class="btn">导出分析报告</button>
+          <span class="hint-inline">导出后可拿去 osu! 编辑器继续手改</span>
+        </div>
+
+        <div class="btns">
+          <button id="btnStart" class="btn btn-primary btn-lg">开始 <kbd>空格</kbd></button>
+          <button id="btnBack" class="btn">换谱面</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 延迟校准 ============ -->
+    <section id="screen-calib" class="screen hidden">
+      <div class="card card-sm">
+        <h2>延迟校准</h2>
+        <p class="sub">每小节 4 拍，<b>只有第 4 拍是高音</b>。<br>
+          只在高音上敲，敲满 8 下就会算出你平时的偏差。</p>
+        <div id="calibCircle" class="calib-circle"></div>
+        <p id="calibCount" class="calib-count">0 / 12</p>
+        <p id="calibInfo" class="msg"></p>
+        <div class="btns">
+          <button id="btnCalibApply" class="btn btn-primary" disabled>应用</button>
+          <button id="btnCalibAgain" class="btn">重来</button>
+          <button id="btnCalibCancel" class="btn">取消</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 暂停 ============ -->
+    <section id="screen-pause" class="screen hidden">
+      <div class="card card-sm">
+        <h2>已暂停</h2>
+        <div class="btns col">
+          <button id="btnResume" class="btn btn-primary">继续 <kbd>Esc</kbd></button>
+          <button id="btnRetry2" class="btn">重试</button>
+          <button id="btnQuit" class="btn">放弃并退出</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 结算 ============ -->
+    <section id="screen-results" class="screen hidden">
+      <div class="card">
+        <div class="result-head">
+          <div id="grade" class="grade">S</div>
+          <div>
+            <h2 id="resultTitle">—</h2>
+            <p id="resultMeta" class="sub">—</p>
+          </div>
+        </div>
+        <div class="score-big" id="resultScore">0</div>
+        <div class="acc-row">
+          <div><span id="resultAcc">0.00%</span><em>准确率</em></div>
+          <div><span id="resultCombo">0</span><em>最大连击</em></div>
+        </div>
+        <dl id="resultCounts" class="stats counts"></dl>
+        <p class="hint">评级按准确率：SS 满准确率且无 MISS · S 93% · A 85% · B 75% · C 65%</p>
+        <div class="btns">
+          <button id="btnRetry" class="btn btn-primary">重试</button>
+          <button id="btnResultsBack" class="btn">换谱面</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 载入中 ============ -->
+    <section id="screen-loading" class="screen hidden">
+      <div class="card card-sm">
+        <p id="loadingMsg">载入中…</p>
+      </div>
+    </section>
+
+    <input id="fileInput" type="file" multiple accept=".osu,.osz,.mp3,.ogg,.wav,.jpg,.png" hidden>
+    <input id="dirInput" type="file" webkitdirectory hidden>
+    <input id="autoInput" type="file" accept=".mp3,.ogg,.wav,.m4a,.flac" hidden>
+  </div>
+</div>
+
+<script>
+  // 兜底：任何脚本错误 / 资源加载失败都在页面上显示出来，而不是留一块黑屏
+  (function () {
+    function show(msg) {
+      var el = document.getElementById('bootError');
+      if (!el) return;
+      el.hidden = false;
+      el.textContent = msg + '  （按 F12 打开控制台看详情）';
+    }
+    window.addEventListener('error', function (e) {
+      if (e.target && e.target.tagName === 'SCRIPT') show('脚本没加载上：' + (e.target.src || ''));
+      else show('脚本出错：' + (e.message || e.error || '未知错误'));
+    }, true);
+    window.addEventListener('unhandledrejection', function (e) {
+      var r = e.reason;
+      show('异步出错：' + (r && r.message ? r.message : r));
+    });
+  })();
+</script>
+<script src="js/core.js"></script>
+<script src="js/audio.js"></script>
+<script src="js/demo.js"></script>
+<script src="js/autochart.js"></script>
+<script src="js/flv.js"></script>
+<script src="js/render.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
