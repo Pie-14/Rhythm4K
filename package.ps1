@@ -4,7 +4,7 @@
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$version = '0.2.0'
+$version = '0.3.0'
 $name = "Rhythm4K-$version"
 $dist = Join-Path $root 'dist'
 $stage = Join-Path $dist $name

@@ -8,7 +8,7 @@
   const $ = function (id) { return document.getElementById(id); };
 
   const STORE_KEY = 'rhythm4k.settings.v2';
-  const DEFAULTS = { offset: 0, scroll: 700, volume: 85, dim: 55 };
+  const DEFAULTS = { offset: 0, scroll: 700, volume: 85, dim: 55, orientation: 'auto' };
   const SCREENS = ['menu', 'ready', 'pause', 'results', 'loading', 'calib'];
 
   const app = {
@@ -585,12 +585,15 @@
       return;
     }
 
+    $('btnHudPause').classList.remove('hidden');
     app.keyCodes = keyCodesFor(app.chart.keyCount);
     app.engine = new M4K.Engine(app.chart);
     app.keysDown = new Array(app.chart.keyCount).fill(false);
     app.lastFrame = null;
     app.finishingAt = 0;
     app.frozenSong = null;
+    touchLanes.clear();
+    applyOrientation();
     app.renderer.setChart(app.chart);
     app.renderer.reset();
 
@@ -624,6 +627,7 @@
   }
 
   function finish() {
+    $('btnHudPause').classList.add('hidden');
     app.state = 'results';
     // 结算页背后保留最后一帧画面，不要跳回开头
     app.frozenSong = app.lastFrame ? app.lastFrame.song : app.audio.now() + app.settings.offset;
@@ -671,6 +675,7 @@
   }
 
   function quit() {
+    $('btnHudPause').classList.add('hidden');
     app.audio.stop();
     if (app.media.video) {
       try { app.media.video.pause(); } catch (e) { /* ignore */ }
@@ -858,6 +863,96 @@
       app.state = 'menu';
       show('menu');
     }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 屏幕方向
+   * ------------------------------------------------------------------ */
+  function isTouchDevice() {
+    try {
+      return (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) ||
+        ('ontouchstart' in window);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** auto = 触屏或竖着的窗口就走竖屏 */
+  function resolveOrientation() {
+    const mode = app.settings.orientation || 'auto';
+    if (mode === 'portrait' || mode === 'landscape') return mode;
+    if (isTouchDevice()) return 'portrait';
+    return window.innerHeight > window.innerWidth ? 'portrait' : 'landscape';
+  }
+
+  function applyOrientation() {
+    const mode = resolveOrientation();
+    app.orientation = mode;
+    if (app.renderer && app.renderer.setOrientation) app.renderer.setOrientation(mode);
+    syncOrientationUi();
+  }
+
+  function syncOrientationUi() {
+    const seg = $('orientSeg');
+    if (!seg || !seg.querySelectorAll) return;
+    const current = app.settings.orientation || 'auto';
+    const buttons = seg.querySelectorAll('button');
+    for (let i = 0; i < buttons.length; i++) {
+      const on = buttons[i].getAttribute('data-orient') === current;
+      buttons[i].classList.toggle('active', on);
+    }
+  }
+
+  function setOrientationMode(mode) {
+    app.settings.orientation = mode;
+    saveSettings();
+    applyOrientation();
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 触控：底部的四个按钮
+   * ------------------------------------------------------------------ */
+  const touchLanes = new Map(); // pointerId -> lane
+
+  function touchLaneAt(e) {
+    const p = app.renderer.logicalPoint(e.clientX, e.clientY);
+    return app.renderer.laneAt(p.x, p.y);
+  }
+
+  function onPointerDown(e) {
+    if (app.state !== 'playing') return;
+    // 鼠标在桌面模式下不用（键盘才是主输入），触屏/手写笔才算
+    if (e.pointerType === 'mouse' && !isTouchDevice()) return;
+    const lane = touchLaneAt(e);
+    if (lane < 0) return;
+    e.preventDefault();
+    if (touchLanes.has(e.pointerId)) return;
+    touchLanes.set(e.pointerId, lane);
+    try { app.canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    if (app.keysDown[lane]) return;
+
+    app.keysDown[lane] = true;
+    const res = app.engine.press(lane, judgeTimeForEvent(e.timeStamp));
+    if (res) {
+      app.renderer.flash(res.judgement);
+      app.renderer.addHit(res.delta, res.judgement);
+    }
+  }
+
+  function onPointerUp(e) {
+    const lane = touchLanes.get(e.pointerId);
+    if (lane === undefined) return;
+    touchLanes.delete(e.pointerId);
+    if (app.state !== 'playing') return;
+
+    // 同一轨道上还有别的手指按着，就先别松开
+    let still = false;
+    touchLanes.forEach(function (l) { if (l === lane) still = true; });
+    if (still) return;
+
+    app.keysDown[lane] = false;
+    const res = app.engine.release(lane, judgeTimeForEvent(e.timeStamp));
+    if (res && res.type === 'holdbreak') app.renderer.flash(M4K.JUDGEMENTS.miss);
   }
 
   /* ------------------------------------------------------------------ *
@@ -1073,6 +1168,7 @@
     $('setVolume').addEventListener('input', function (e) {
       app.settings.volume = Math.round(Number(e.target.value) || 0);
       app.audio.setVolume(app.settings.volume / 100);
+    syncOrientationUi();
       saveSettings();
     });
     $('setDim').addEventListener('input', function (e) {
@@ -1091,6 +1187,29 @@
   function bindInput() {
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('keyup', onKeyUp, true);
+
+    // 触控：底部按钮区按下/抬起
+    const canvas = $('scene');
+    app.canvas = canvas;
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointercancel', onPointerUp);
+    canvas.addEventListener('pointerleave', onPointerUp);
+
+    // 方向切换
+    const seg = $('orientSeg');
+    if (seg) {
+      if (seg.addEventListener) seg.addEventListener('click', function (e) {
+        const btn = e.target && e.target.closest ? e.target.closest('button[data-orient]') : null;
+        if (!btn) return;
+        setOrientationMode(btn.getAttribute('data-orient'));
+      });
+    }
+
+    // 窗口尺寸/方向变化时重新判定
+    window.addEventListener('resize', function () {
+      if (app.settings.orientation === 'auto') applyOrientation();
+    });
   }
 
   function bindDrop() {
@@ -1137,6 +1256,7 @@
     $('setVolume').value = app.settings.volume;
     $('setDim').value = app.settings.dim;
     app.audio.setVolume(app.settings.volume / 100);
+    syncOrientationUi();
   }
 
   /* ------------------------------------------------------------------ *
@@ -1236,6 +1356,7 @@
     bindInput();
     bindDrop();
     applySettingsToUi();
+    applyOrientation();
 
     const params = new URLSearchParams(location.search);
     if (params.get('debug') === 'field') {
@@ -1262,6 +1383,7 @@
   window.__rhythm4k = app;
   window.__rhythm4kDebug = {
     calib: function () { return calib; },
+    setOrientation: function (m) { return setOrientationMode(m); },
     setupMedia: setupMedia,
     teardownMedia: teardownMedia,
     syncVideo: function () { syncVideo(currentSong()); },

@@ -40,6 +40,9 @@
       this.canvas = canvas;
       this.ctx = canvas.getContext('2d', { alpha: false });
       this.keyCount = 4;
+      this.orientation = 'landscape'; // landscape 1920×1080 / portrait 1080×1920
+      this.W = W;
+      this.H = H;
       this.songTime = 0;
       this.pxPerMs = 1.3;
       this.judgeFx = null;
@@ -55,20 +58,25 @@
     /* ---------------- 布局 ---------------- */
     layout() {
       const k = this.keyCount;
-      this.laneW = k <= 4 ? 100 : k <= 7 ? 84 : 70;
-      this.gap = 4;
+      const portrait = this.orientation === 'portrait';
+
+      // 竖屏（手机）：轨道宽一些好点，判定线上移到 78% 处，
+      // 下面这段就是大拇指区域
+      this.laneW = portrait ? 150 : (k <= 4 ? 100 : k <= 7 ? 84 : 70);
+      this.gap = portrait ? 6 : 4;
       this.fieldW = k * this.laneW + (k - 1) * this.gap;
-      this.fieldX = Math.round((W - this.fieldW) / 2);
-      this.judgeY = JUDGE_Y;
-      this.stageBottom = H; // 轨道一直延伸到底部
-      this.keyBarTop = JUDGE_Y;
+      this.fieldX = Math.round((this.W - this.fieldW) / 2);
+      this.judgeY = portrait ? Math.round(this.H * 0.78) : JUDGE_Y;
+      this.stageBottom = this.H; // 轨道一直延伸到底部
+      this.keyBarTop = this.judgeY;
+      this.padMaxH = portrait ? 300 : 0; // 竖屏按钮限高，贴底
       // 音符尺寸跟着轨道宽度算：更高、更窄（原来 30 高 / 全宽太扁太宽）
       this.noteH = Math.round(this.laneW * 0.36);
       this.noteInset = 3; // 音符几乎和轨道同宽
       this.hues = this._hues();
 
       const ctx = this.ctx;
-      this.bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+      this.bgGrad = ctx.createLinearGradient(0, 0, 0, this.H);
       this.bgGrad.addColorStop(0, '#070911');
       this.bgGrad.addColorStop(0.6, '#0b0f1a');
       this.bgGrad.addColorStop(1, '#121826');
@@ -77,7 +85,7 @@
       this.topFade.addColorStop(0, 'rgba(4,6,10,0.8)');
       this.topFade.addColorStop(1, 'rgba(4,6,10,0)');
 
-      this.vignette = ctx.createRadialGradient(W / 2, H * 0.5, H * 0.3, W / 2, H * 0.5, H * 0.98);
+      this.vignette = ctx.createRadialGradient(this.W / 2, this.H * 0.5, this.H * 0.3, this.W / 2, this.H * 0.5, this.H * 0.98);
       this.vignette.addColorStop(0, 'rgba(0,0,0,0)');
       this.vignette.addColorStop(1, 'rgba(0,0,0,0.5)');
 
@@ -90,6 +98,42 @@
         g.addColorStop(1, 'hsla(' + this.hues[i] + ', 76%, 50%, 0.50)');
         this.laneGrads.push(g);
       }
+    }
+
+    /** 切换横竖屏：重算布局并重新适配画布 */
+    setOrientation(mode) {
+      const next = mode === 'portrait' ? 'portrait' : 'landscape';
+      if (this.orientation === next) return;
+      this.orientation = next;
+      if (next === 'portrait') {
+        this.W = 1080;
+        this.H = 1920;
+      } else {
+        this.W = W;
+        this.H = H;
+      }
+      this.layout();
+      this.resize();
+    }
+
+    /** 指针坐标（clientX/clientY）→ 逻辑坐标 */
+    logicalPoint(clientX, clientY) {
+      const rect = this.canvas.getBoundingClientRect();
+      if (!rect.width || !rect.height) return { x: -1, y: -1 };
+      const bx = (clientX - rect.left) * (this.canvas.width / rect.width);
+      const by = (clientY - rect.top) * (this.canvas.height / rect.height);
+      return { x: (bx - this.ox) / this.scale, y: (by - this.oy) / this.scale };
+    }
+
+    /** 逻辑坐标落在哪条轨道的按键区；不在返回 -1 */
+    laneAt(x, y) {
+      if (x < this.fieldX || x >= this.fieldX + this.fieldW) return -1;
+      // 手指没那么准：判定线往上两个音符高度之内都算
+      if (y < this.judgeY - this.noteH * 2) return -1;
+      if (y > this.stageBottom) return -1;
+      const i = Math.floor((x - this.fieldX) / (this.laneW + this.gap));
+      if (i < 0 || i >= this.keyCount) return -1;
+      return i;
     }
 
     _hues() {
@@ -111,9 +155,9 @@
       const h = Math.max(1, Math.round(this.canvas.clientHeight * dpr));
       if (this.canvas.width !== w) this.canvas.width = w;
       if (this.canvas.height !== h) this.canvas.height = h;
-      this.scale = Math.min(w / W, h / H);
-      this.ox = Math.round((w - W * this.scale) / 2);
-      this.oy = Math.round((h - H * this.scale) / 2);
+      this.scale = Math.min(w / this.W, h / this.H);
+      this.ox = Math.round((w - this.W * this.scale) / 2);
+      this.oy = Math.round((h - this.H * this.scale) / 2);
     }
 
     /* ---------------- 状态 ---------------- */
@@ -160,7 +204,7 @@
     /* ---------------- 背景 ---------------- */
     _drawBackground(ctx, state) {
       ctx.fillStyle = this.bgGrad;
-      ctx.fillRect(0, 0, W, H);
+      ctx.fillRect(0, 0, this.W, this.H);
 
       const media = state.media;
       let drew = false;
@@ -168,11 +212,11 @@
         const iw = media.videoWidth || media.naturalWidth || media.width || 0;
         const ih = media.videoHeight || media.naturalHeight || media.height || 0;
         if (iw > 0 && ih > 0) {
-          const scale = Math.max(W / iw, H / ih);
+          const scale = Math.max(this.W / iw, this.H / ih);
           const dw = iw * scale;
           const dh = ih * scale;
           try {
-            ctx.drawImage(media, (W - dw) / 2, (H - dh) / 2, dw, dh);
+            ctx.drawImage(media, (this.W - dw) / 2, (this.H - dh) / 2, dw, dh);
             drew = true;
           } catch (e) {
             drew = false;
@@ -183,13 +227,13 @@
       if (drew) {
         const dim = state.bgDim === undefined ? 0.55 : state.bgDim;
         ctx.fillStyle = 'rgba(0,0,0,' + dim + ')';
-        ctx.fillRect(0, 0, W, H);
+        ctx.fillRect(0, 0, this.W, this.H);
         ctx.fillStyle = this.vignette;
-        ctx.fillRect(0, 0, W, H);
+        ctx.fillRect(0, 0, this.W, this.H);
       }
 
       ctx.fillStyle = this.topFade;
-      ctx.fillRect(0, 0, W, 220);
+      ctx.fillRect(0, 0, this.W, 220);
     }
 
     /* ---------------- 轨道 ---------------- */
@@ -198,7 +242,7 @@
     }
 
     yFor(time) {
-      return JUDGE_Y - (time - this.songTime) * this.pxPerMs;
+      return this.judgeY - (time - this.songTime) * this.pxPerMs;
     }
 
     hueOf(col) {
@@ -233,7 +277,7 @@
       const inset = this.noteInset;
       const nw = this.laneW - inset * 2;
       const nh = this.noteH;
-      const top = JUDGE_Y - nh / 2;
+      const top = this.judgeY - nh / 2;
 
       for (let i = 0; i < this.keyCount; i++) {
         const x = this.xOf(i) + inset;
@@ -255,14 +299,16 @@
 
         // 中心一条细横线，帮助对齐
         ctx.fillStyle = pressed ? 'rgba(255,255,255,0.9)' : 'hsla(' + hue + ', 85%, 78%, 0.55)';
-        ctx.fillRect(x + 8, JUDGE_Y - 1, nw - 16, 2);
+        ctx.fillRect(x + 8, this.judgeY - 1, nw - 16, 2);
       }
     }
 
     _drawKeyPads(ctx, keys) {
       const inset = Math.round(this.laneW * 0.1);
-      const padTop = JUDGE_Y + this.noteH / 2 + 16;
-      const padH = H - 74 - padTop; // 底下留给进度条
+      const padBottom = this.H - 74; // 底下留给进度条
+      let padH = padBottom - (this.judgeY + this.noteH / 2 + 16);
+      if (this.padMaxH) padH = Math.min(padH, this.padMaxH);
+      const padTop = padBottom - padH; // 贴底对齐
 
       for (let i = 0; i < this.keyCount; i++) {
         const x = this.xOf(i) + inset;
@@ -336,7 +382,7 @@
       const hue = this.hueOf(n.col);
       const holding = n.state === 'holding';
       const broken = n.state === 'broken';
-      const headY = (holding || broken) ? JUDGE_Y : this.yFor(n.time);
+      const headY = (holding || broken) ? this.judgeY : this.yFor(n.time);
       const nx = x + this.noteInset;
       const nw = this.laneW - this.noteInset * 2;
       const nh = this.noteH;
@@ -346,7 +392,7 @@
         const tailY = this.yFor(n.end);
         const top = Math.min(tailY, headY);
         const bottom = Math.max(tailY, headY);
-        if (bottom > -80 && top < H + 80 && bottom - top > 1) {
+        if (bottom > -80 && top < this.H + 80 && bottom - top > 1) {
           const bodyAlpha = broken ? 0.30 : (holding ? 0.55 : 0.68);
           ctx.fillStyle = 'hsla(' + hue + ', 74%, 54%, ' + bodyAlpha + ')';
           roundRect(ctx, nx, top, nw, bottom - top, 7);
@@ -369,7 +415,7 @@
       if (broken) return;
 
       // 头部
-      if (headY < -nh || headY > H + nh) return;
+      if (headY < -nh || headY > this.H + nh) return;
       const top = headY - nh / 2;
 
       ctx.fillStyle = this.noteFill(n.col);
@@ -394,27 +440,30 @@
       text(ctx, formatScorePadded(s.score), 48, 82, '700 46px ' + MONO, '#ffffff', 'left');
 
       // 右上：准确率
-      text(ctx, '准确率', W - 44, 56, '500 15px ' + UI, 'rgba(255,255,255,0.55)', 'right');
-      text(ctx, (s.accuracy * 100).toFixed(2) + '%', W - 44, 96, '700 36px ' + MONO, '#ffffff', 'right');
+      text(ctx, '准确率', this.W - 44, 56, '500 15px ' + UI, 'rgba(255,255,255,0.55)', 'right');
+      text(ctx, (s.accuracy * 100).toFixed(2) + '%', this.W - 44, 96, '700 36px ' + MONO, '#ffffff', 'right');
 
       if (this.comboPunch > 0.01) this.comboPunch *= 0.85;
       else this.comboPunch = 0;
 
       // 连击放左下角，避免挡住中间的下落音符
       if (s.combo >= 2) {
+        const portrait = this.orientation === 'portrait';
         const punch = this.comboPunch > 0 ? 1 + this.comboPunch * 0.06 : 1;
-        const size = Math.round(64 * punch);
+        const size = Math.round((portrait ? 48 : 64) * punch);
+        const cx0 = portrait ? 40 : 48;
+        const cy0 = portrait ? this.judgeY - 120 : 930;
         ctx.save();
         ctx.textAlign = 'left';
         ctx.textBaseline = 'alphabetic';
         ctx.font = '800 ' + size + 'px ' + MONO;
         ctx.fillStyle = 'rgba(0,0,0,0.5)';
-        ctx.fillText(String(s.combo), 51, 933);
+        ctx.fillText(String(s.combo), cx0 + 3, cy0 + 3);
         ctx.fillStyle = 'rgba(255,255,255,0.92)';
-        ctx.fillText(String(s.combo), 48, 930);
+        ctx.fillText(String(s.combo), cx0, cy0);
         ctx.font = '700 14px ' + UI;
         ctx.fillStyle = 'rgba(255,255,255,0.45)';
-        ctx.fillText('COMBO', 48, 954);
+        ctx.fillText('COMBO', cx0, cy0 + 24);
         ctx.restore();
       }
       const cx = this.fieldX + this.fieldW / 2;
@@ -438,8 +487,8 @@
       // 底部：进度条 + 时间
       const duration = state.duration || 0;
       const barX = 40;
-      const barW = W - 80;
-      const barY = 1036;
+      const barW = this.W - 80;
+      const barY = this.orientation === 'portrait' ? this.H - 20 : 1036;
       ctx.fillStyle = 'rgba(255,255,255,0.14)';
       roundRect(ctx, barX, barY, barW, 6, 3);
       ctx.fill();
@@ -461,7 +510,7 @@
     // hit error 条：竖在屏幕右侧，上 = 早，下 = 晚，中间那格是 0
     _drawHitError(ctx) {
       if (!this.hits.length) return;
-      const x = W - 72;
+      const x = this.W - 72;
       const top = 320;
       const bot = 780;
       const mid = (top + bot) / 2;

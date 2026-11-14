@@ -2,13 +2,14 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Rhythm4K</title>
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
 <div id="app">
   <canvas id="scene"></canvas>
+  <button id="btnHudPause" class="hud-pause hidden" title="暂停">Ⅱ</button>
   <div id="bootError" class="boot-error" hidden></div>
 
   <div id="ui">
@@ -17,6 +18,15 @@
       <div class="card">
         <h1>Rhythm<span class="accent">4K</span></h1>
         <p class="sub">4 轨下落式 · 普通音符 + 长条 · 兼容 osu!mania 谱面 · 也能从一首歌自动生成</p>
+
+        <div class="seg-row">
+          <span class="seg-label">界面方向</span>
+          <div class="seg" id="orientSeg">
+            <button type="button" data-orient="landscape">横屏</button>
+            <button type="button" data-orient="portrait">竖屏</button>
+            <button type="button" data-orient="auto">自动</button>
+          </div>
+        </div>
 
         <div id="drop" class="drop">
           <p class="drop-title">把 <b>.osz</b> / <b>.osu</b> 或整个曲目文件夹拖到这里</p>
@@ -39,6 +49,7 @@
         <div id="chartList" class="chart-list hidden"></div>
         <p id="menuMsg" class="msg"></p>
         <p class="hint">键位 <kbd>D</kbd><kbd>F</kbd><kbd>J</kbd><kbd>K</kbd> · <kbd>空格</kbd> 开始 · <kbd>Esc</kbd> 暂停 · <kbd>F11</kbd> 全屏</p>
+        <p class="ver">v0.3.0</p>
       </div>
     </section>
 
