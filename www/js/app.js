@@ -230,22 +230,77 @@
     enterReady();
   }
 
+  /** 看看这段字节到底是不是音频/图片 —— 服务器 404 页面也会返回一坨 HTML */
+  function sniff(buf, kind) {
+    if (!buf || buf.byteLength < 16) return false;
+    const u = new Uint8Array(buf, 0, 16);
+    if (kind === 'audio') {
+      if (u[0] === 0x49 && u[1] === 0x44 && u[2] === 0x33) return true;                  // ID3
+      if (u[0] === 0xff && (u[1] & 0xe0) === 0xe0) return true;                           // MPEG 帧
+      if (u[0] === 0x4f && u[1] === 0x67 && u[2] === 0x67 && u[3] === 0x53) return true;  // OggS
+      if (u[0] === 0x66 && u[1] === 0x74 && u[2] === 0x79 && u[3] === 0x70) return true;  // ftyp
+      if (u[0] === 0x52 && u[1] === 0x49 && u[2] === 0x46 && u[3] === 0x46) return true;  // RIFF
+      return false;
+    }
+    if (u[0] === 0xff && u[1] === 0xd8 && u[2] === 0xff) return true;                     // JPEG
+    if (u[0] === 0x89 && u[1] === 0x50 && u[2] === 0x4e && u[3] === 0x47) return true;    // PNG
+    if (u[0] === 0x52 && u[1] === 0x49 && u[2] === 0x46 && u[3] === 0x46) return true;    // RIFF/WEBP
+    return false;
+  }
+
+  /** 取一段可选资源；读不到或格式不对就返回 null，永远不抛 */
+  async function fetchOptional(url, kind) {
+    try {
+      const res = await fetch(url);
+      const buf = await res.arrayBuffer();
+      return sniff(buf, kind) ? buf : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 兜底：程序合成的示例曲 */
+  function synthesizeDemo() {
+    app.demoFallback = true;
+    const demo = M4K.demo.build();
+    app.chart = M4K.parseOsu(demo.text);
+    app.audioBuffer = M4K.demo.buildAudio(app.audio.ctx, demo.objects);
+    enterReady();
+  }
+
   async function loadDemo() {
+    // 包一层：示例曲是可选功能，任何一步失败都不该弹错误框，直接退回合成曲
+    try {
+      await loadDemoInner();
+    } catch (e) {
+      console.warn('示例曲加载失败，改用合成曲', e);
+      try {
+        synthesizeDemo();
+      } catch (e2) {
+        console.error(e2);
+        show('menu');
+        msg('示例曲加载失败：' + (e2 && e2.message ? e2.message : e2));
+      }
+    }
+  }
+
+  async function loadDemoInner() {
     setLoading('载入示例曲…');
     await nextTick();
     await app.audio.ensure();
 
-    // 优先用内置的真实音频（www/audio/demo.mp3），读不到就退回程序合成的曲子。
-    // file:// 下读本地文件需要 --allow-file-access-from-files，启动器已经带上了。
+    // 优先用内置的真实音频（www/audio/demo.mp3）。
+    // 部署到 GitHub Pages 时这个目录被 .gitignore 排除了，
+    // 请求会返回 404 的 HTML——所以必须先验字节再解码。
     let buffer = null;
-    try {
-      // 注意：file:// 下 fetch 的响应的 status 是 0、ok 是 false，
-      // 所以不能判断 res.ok，只能直接读字节再检查长度。
-      const res = await fetch('audio/demo.mp3');
-      const raw = await res.arrayBuffer();
-      if (raw && raw.byteLength > 4096) buffer = await app.audio.decode(raw);
-    } catch (e) {
-      console.warn('内置音频读取失败，改用合成曲', e);
+    const rawAudio = await fetchOptional('audio/demo.mp3', 'audio');
+    if (rawAudio) {
+      try {
+        buffer = await app.audio.decode(rawAudio);
+      } catch (e) {
+        console.warn('内置音频解码失败，改用合成曲', e);
+        buffer = null;
+      }
     }
 
     if (buffer && M4K.autochart) {
@@ -262,16 +317,10 @@
           artist: '内置示例曲',
         });
         if (chart && chart.notes.length) {
-          // 例曲封面当背景（没有就保持纯色渐变）
-          try {
-            const imgRes = await fetch('audio/demo.jpg');
-            const imgBuf = await imgRes.arrayBuffer();
-            if (imgBuf && imgBuf.byteLength > 4096) {
-              app.files.set('demo.jpg', new File([imgBuf], 'demo.jpg', { type: 'image/jpeg' }));
-              chart.background = 'demo.jpg';
-            }
-          } catch (e) {
-            console.warn('示例曲封面没读到', e);
+          const rawImg = await fetchOptional('audio/demo.jpg', 'image');
+          if (rawImg) {
+            app.files.set('demo.jpg', new File([rawImg], 'demo.jpg', { type: 'image/jpeg' }));
+            chart.background = 'demo.jpg';
           }
 
           app.autoAnalysis = analysis;
@@ -286,14 +335,9 @@
       }
     }
 
-    // 兜底：程序合成的示例曲
-    app.demoFallback = true;
     setLoading('合成示例曲…');
     await nextTick();
-    const demo = M4K.demo.build();
-    app.chart = M4K.parseOsu(demo.text);
-    app.audioBuffer = M4K.demo.buildAudio(app.audio.ctx, demo.objects);
-    enterReady();
+    synthesizeDemo();
   }
 
   /* ------------------------------------------------------------------ *
@@ -787,9 +831,23 @@
     gain.gain.exponentialRampToValueAtTime(peak, at + 0.004);
     gain.gain.exponentialRampToValueAtTime(0.0001, at + (high ? 0.10 : 0.07));
     osc.connect(gain);
-    gain.connect(app.audio.gain || ctx.destination);
+    // 全部汇到校准专用的总增益上，退出时一次性掐断
+    gain.connect(calib.out || app.audio.gain || ctx.destination);
     osc.start(at);
     osc.stop(at + 0.12);
+    if (calib) calib.oscs.push(osc);
+    return osc;
+  }
+
+  /** 停掉本轮所有排期的提示音（否则退出后还会响十几秒） */
+  function stopCalibSound() {
+    if (!calib) return;
+    for (let i = 0; i < calib.oscs.length; i++) {
+      try { calib.oscs[i].stop(0); } catch (e) { /* 已经停过 */ }
+    }
+    calib.oscs.length = 0;
+    try { if (calib.out) calib.out.disconnect(); } catch (e) { /* ignore */ }
+    calib.out = null;
   }
 
   async function startCalibration() {
@@ -799,6 +857,8 @@
       msg('音频启动失败：' + e.message);
       return;
     }
+    // 上一轮可能还在响：之前没掐断会让两套提示音叠在一起，测出来的偏差就全乱了
+    if (calib) { stopCalibSound(); calib = null; }
     app.audio.stop();
 
     const ctx = app.audio.ctx;
@@ -813,7 +873,10 @@
       taps: [],
       done: false,
       result: null,
+      oscs: [],
+      out: ctx.createGain(),
     };
+    calib.out.connect(app.audio.gain || ctx.destination);
 
     // 每小节 4 拍：前 3 拍是低音（只做参考），第 4 拍高音（要敲的就是它）
     for (let bar = 0; bar < CALIB.bars; bar++) {
@@ -841,7 +904,9 @@
     const sign = r.offset >= 0 ? '+' : '';
     let text = '平均偏差 ' + sign + Math.round(r.offset) + ' ms（波动 ' + Math.round(r.spread) + ' ms）';
     if (r.spread > 70) text += '　波动偏大，建议重来一次';
-    if (Math.abs(r.offset) > 200) text += '　偏差过大，检查一下耳机/音箱延迟';
+    if (Math.abs(r.offset) > 250) {
+      text += '　偏差异常大——先确认没有戴着蓝牙耳机，或者上一轮的提示音还在响';
+    }
     $('calibInfo').textContent = text;
   }
 
@@ -855,6 +920,7 @@
   }
 
   function endCalibration() {
+    stopCalibSound();
     calib = null;
     if (app.chart) {
       app.state = 'ready';

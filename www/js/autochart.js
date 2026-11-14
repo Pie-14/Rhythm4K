@@ -376,9 +376,9 @@
   const DIFFICULTIES = {
     // 简单/普通比初版更密：允许多到 8 分 / 16 分，长条概率也提高
     // maxChord = 同一时刻最多几个键；chordEveryBeats = 每隔几拍才允许和弦
-    easy: { stepsPerBeat: 2, minGapBeats: 0.8, minStrength: 0.39, runGapBeats: 0.58, maxChord: 2, chordOnBeats: [0], chordFactor: 0.5, targetPerBeat: 1.15 },
-    normal: { stepsPerBeat: 4, minGapBeats: 0.28, minStrength: 0.09, runGapBeats: 0.62, maxChord: 2, chordOnBeats: [0], chordFactor: 1.2, targetPerBeat: 2.4 },
-    hard: { stepsPerBeat: 4, minGapBeats: 0.25, minStrength: 0.10, runGapBeats: 0.7, maxChord: 3, chordOnBeats: [0], chordFactor: 1.2, targetPerBeat: 3.4 },
+    easy: { stepsPerBeat: 2, minGapBeats: 0.5, minStrength: 0.32, runGapBeats: 0.58, maxChord: 2, chordOnBeats: [0], chordFactor: 0.5, targetPerBeat: 1.4 },
+    normal: { stepsPerBeat: 4, minGapBeats: 0.24, minStrength: 0.09, runGapBeats: 0.62, maxChord: 2, chordOnBeats: [0], chordFactor: 1.2, targetPerBeat: 2.4 },
+    hard: { stepsPerBeat: 4, minGapBeats: 0.22, minStrength: 0.10, runGapBeats: 0.7, maxChord: 3, chordOnBeats: [0], chordFactor: 1.2, targetPerBeat: 3.4 },
   };
 
   /**
@@ -645,23 +645,42 @@
         // 高潮(1.0) 约 1.3 倍，间奏(0.0) 约 0.55 倍
         const cap = Math.max(1, Math.round(base * 2 * (0.55 + 0.75 * Math.max(intensity, avgIntensity))));
 
-        // 高潮段把网格收到「八分音符」：十六分的弱拍直接不要，
-        // 同时正拍/下拍加权，让重音落在小节第一拍上。
-        // 这比单纯调排序更有效——弱拍少了，节奏自然就整齐。
-        const fineOk = intensity < 0.55;
-        const downWeight = 1 + 1.8 * intensity;
-        const beatWeight = 1 + 0.9 * intensity;
+        // 密度上限按段落走，但**不筛网格**：切分的鼓点必须留下来。
+        // 排序只给正拍一点点加权（同强度时优先正拍），不能盖过起音本身的强弱——
+        // 否则谱面会变成「整整齐齐全在正拍上」，跟音乐脱节。
+        const downWeight = 1.30 + 0.30 * intensity;  // 小节第一拍：1.30 ~ 1.60
+        const beatWeight = 1.12 + 0.18 * intensity;  // 其它正拍：1.12 ~ 1.30
         const rank = function (ev) {
           if (!ev.onBeat) return ev.strength;
           return ev.strength * (ev.barBeat === 0 ? downWeight : beatWeight);
         };
 
-        const pool = list.filter(function (e) {
-          return fineOk || (e.sub % 2) === 0;
-        });
-        pool.sort(function (a, b) { return rank(b) - rank(a); });
+        list.sort(function (a, b) { return rank(b) - rank(a); });
 
-        const take = pool.slice(0, cap);
+        const take = list.slice(0, cap);
+
+        // 小节第一拍保底：这一窗口里拍了第一拍（起音足够强）但被挤掉了，
+        // 就用它换掉窗口里最弱的那个音。加权解决不了这个问题——
+        // 下拍本来就是最强的，被挤掉的往往是弱拍；能拉开差距的是「保证有」。
+        const downCand = list.filter(function (e) { return e.onBeat && e.barBeat === 0; });
+        if (downCand.length) {
+          let hasDown = false;
+          for (let i = 0; i < take.length; i++) {
+            if (take[i].onBeat && take[i].barBeat === 0) { hasDown = true; break; }
+          }
+          if (!hasDown) {
+            downCand.sort(function (a, b) { return b.strength - a.strength; });
+            let weakIdx = -1;
+            let weakVal = Infinity;
+            for (let i = 0; i < take.length; i++) {
+              if (take[i].onBeat && take[i].barBeat === 0) continue;
+              const v = take[i].strength * (take[i].onBeat ? 1.15 : 1);
+              if (v < weakVal) { weakVal = v; weakIdx = i; }
+            }
+            if (weakIdx >= 0) take[weakIdx] = downCand[0];
+          }
+        }
+
         take.sort(function (a, b) { return a.time - b.time; });
         for (let i = 0; i < take.length; i++) kept.push(take[i]);
       });

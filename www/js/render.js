@@ -62,7 +62,7 @@
 
       // 竖屏（手机）：轨道宽一些好点，判定线上移到 78% 处，
       // 下面这段就是大拇指区域
-      this.laneW = portrait ? 150 : (k <= 4 ? 100 : k <= 7 ? 84 : 70);
+      this.laneW = portrait ? 180 : (k <= 4 ? 100 : k <= 7 ? 84 : 70);
       this.gap = portrait ? 6 : 4;
       this.fieldW = k * this.laneW + (k - 1) * this.gap;
       this.fieldX = Math.round((this.W - this.fieldW) / 2);
@@ -77,13 +77,47 @@
 
       const ctx = this.ctx;
       this.bgGrad = ctx.createLinearGradient(0, 0, 0, this.H);
-      this.bgGrad.addColorStop(0, '#070911');
-      this.bgGrad.addColorStop(0.6, '#0b0f1a');
-      this.bgGrad.addColorStop(1, '#121826');
+      this.bgGrad.addColorStop(0, '#0c1424');
+      this.bgGrad.addColorStop(0.55, '#121c31');
+      this.bgGrad.addColorStop(1, '#1a2743');
 
       this.topFade = ctx.createLinearGradient(0, 0, 0, 220);
       this.topFade.addColorStop(0, 'rgba(4,6,10,0.8)');
       this.topFade.addColorStop(1, 'rgba(4,6,10,0)');
+
+      // 默认背景的两团光：左上冷蓝 + 右下偏紫，给纯色背景一点纵深
+      this.glowA = ctx.createRadialGradient(
+        this.W * 0.16, this.H * 0.10, 0,
+        this.W * 0.16, this.H * 0.10, Math.max(this.W, this.H) * 0.46);
+      this.glowA.addColorStop(0, 'rgba(60,170,255,0.40)');
+      this.glowA.addColorStop(0.55, 'rgba(78,140,255,0.11)');
+      this.glowA.addColorStop(1, 'rgba(78,140,255,0)');
+
+      this.glowB = ctx.createRadialGradient(
+        this.W * 0.88, this.H * 0.86, 0,
+        this.W * 0.88, this.H * 0.86, Math.max(this.W, this.H) * 0.44);
+      this.glowB.addColorStop(0, 'rgba(160,90,255,0.34)');
+      this.glowB.addColorStop(0.6, 'rgba(150,96,255,0.09)');
+      this.glowB.addColorStop(1, 'rgba(150,96,255,0)');
+
+      // 第三团暖色，和蓝紫拉开色相，背景才不会一片冷
+      this.glowC = ctx.createRadialGradient(
+        this.W * 0.52, this.H * 0.72, 0,
+        this.W * 0.52, this.H * 0.72, Math.max(this.W, this.H) * 0.40);
+      this.glowC.addColorStop(0, 'rgba(255,120,90,0.30)');
+      this.glowC.addColorStop(0.6, 'rgba(255,120,90,0.09)');
+      this.glowC.addColorStop(1, 'rgba(255,120,90,0)');
+
+      // 缓慢上下浮动的一条光带，让背景「动」起来
+      this.bandGrad = ctx.createLinearGradient(0, 0, 0, this.H * 0.55);
+      this.bandGrad.addColorStop(0, 'rgba(90,150,255,0)');
+      this.bandGrad.addColorStop(0.5, 'rgba(90,150,255,0.075)');
+      this.bandGrad.addColorStop(1, 'rgba(90,150,255,0)');
+
+      // 判定线下方的一抹底色，让按键区有「落地」的感觉
+      this.floorGlow = ctx.createLinearGradient(0, this.judgeY - this.noteH * 2, 0, this.H);
+      this.floorGlow.addColorStop(0, 'rgba(70,110,190,0)');
+      this.floorGlow.addColorStop(1, 'rgba(70,110,190,0.10)');
 
       this.vignette = ctx.createRadialGradient(this.W / 2, this.H * 0.5, this.H * 0.3, this.W / 2, this.H * 0.5, this.H * 0.98);
       this.vignette.addColorStop(0, 'rgba(0,0,0,0)');
@@ -125,12 +159,10 @@
       return { x: (bx - this.ox) / this.scale, y: (by - this.oy) / this.scale };
     }
 
-    /** 逻辑坐标落在哪条轨道的按键区；不在返回 -1 */
+    /** 逻辑坐标落在哪条轨道；整条竖条都算（不限底部按键区） */
     laneAt(x, y) {
       if (x < this.fieldX || x >= this.fieldX + this.fieldW) return -1;
-      // 手指没那么准：判定线往上两个音符高度之内都算
-      if (y < this.judgeY - this.noteH * 2) return -1;
-      if (y > this.stageBottom) return -1;
+      if (y < 0 || y > this.stageBottom) return -1;
       const i = Math.floor((x - this.fieldX) / (this.laneW + this.gap));
       if (i < 0 || i >= this.keyCount) return -1;
       return i;
@@ -180,6 +212,11 @@
 
     /* ---------------- 主绘制 ---------------- */
     draw(state) {
+      // 背景动画用的时间（暂停时也继续走，画面不至于完全静止）
+      const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+      if (this._lastNow) this.bgT = (this.bgT || 0) + Math.min(0.1, (nowMs - this._lastNow) / 1000);
+      else this.bgT = 0;
+      this._lastNow = nowMs;
       const ctx = this.ctx;
       const now = performance.now();
       this.songTime = state.songTime || 0;
@@ -202,10 +239,67 @@
     }
 
     /* ---------------- 背景 ---------------- */
-    _drawBackground(ctx, state) {
-      ctx.fillStyle = this.bgGrad;
-      ctx.fillRect(0, 0, this.W, this.H);
 
+    /** 没有背景图时的默认底：渐变 + 两团缓慢漂移的光 + 浮动光带 + 横向网格 */
+    _drawDefaultBg(ctx) {
+      const t = this.bgT || 0;
+      const W = this.W;
+      const H = this.H;
+
+      ctx.fillStyle = this.bgGrad;
+      ctx.fillRect(0, 0, W, H);
+
+      // 三团光沿李萨如轨迹漂移，速度大约 4~6 秒一个来回
+      const ax = Math.sin(t * 1.15) * W * 0.13;
+      const ay = Math.cos(t * 0.90) * H * 0.11;
+      const bx = Math.cos(t * 0.72) * W * 0.15;
+      const by = Math.sin(t * 1.00) * H * 0.12;
+      const cx = Math.sin(t * 0.85 + 1.7) * W * 0.14;
+      const cy = Math.cos(t * 0.68 + 0.6) * H * 0.13;
+
+      ctx.save();
+      ctx.translate(ax, ay);
+      ctx.fillStyle = this.glowA;
+      ctx.fillRect(-W * 0.35, -H * 0.35, W * 1.7, H * 1.7);
+      ctx.restore();
+
+      ctx.save();
+      ctx.translate(bx, by);
+      ctx.fillStyle = this.glowB;
+      ctx.fillRect(-W * 0.35, -H * 0.35, W * 1.7, H * 1.7);
+      ctx.restore();
+
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.fillStyle = this.glowC;
+      ctx.fillRect(-W * 0.35, -H * 0.35, W * 1.7, H * 1.7);
+      ctx.restore();
+
+      // 上下浮动的光带
+      const bandY = (Math.sin(t * 1.05) * 0.5 + 0.5) * H * 0.9;
+      ctx.save();
+      ctx.translate(0, bandY - H * 0.14);
+      ctx.fillStyle = this.bandGrad;
+      ctx.fillRect(0, 0, W, H * 0.55);
+      ctx.restore();
+
+      ctx.fillStyle = this.floorGlow;
+      ctx.fillRect(0, this.judgeY - this.noteH * 2, W, H - this.judgeY + this.noteH * 2);
+
+      // 横向网格：越靠下越明显，像远处的踏板
+      const step = Math.round(this.H / 14);
+      ctx.lineWidth = 1;
+      for (let y = step; y < this.H; y += step) {
+        const p = y / this.H;
+        ctx.strokeStyle = 'rgba(150,196,255,' + (0.022 + p * 0.045).toFixed(3) + ')';
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(this.W, y);
+        ctx.stroke();
+      }
+    }
+
+    _drawBackground(ctx, state) {
       const media = state.media;
       let drew = false;
       if (media) {
@@ -230,6 +324,9 @@
         ctx.fillRect(0, 0, this.W, this.H);
         ctx.fillStyle = this.vignette;
         ctx.fillRect(0, 0, this.W, this.H);
+      } else {
+        // 没有背景图：用程序画的渐变底，比纯黑有层次
+        this._drawDefaultBg(ctx);
       }
 
       ctx.fillStyle = this.topFade;
@@ -450,7 +547,7 @@
       if (s.combo >= 2) {
         const portrait = this.orientation === 'portrait';
         const punch = this.comboPunch > 0 ? 1 + this.comboPunch * 0.06 : 1;
-        const size = Math.round((portrait ? 48 : 64) * punch);
+        const size = Math.round((portrait ? 44 : 64) * punch);
         const cx0 = portrait ? 40 : 48;
         const cy0 = portrait ? this.judgeY - 120 : 930;
         ctx.save();
