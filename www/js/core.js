@@ -212,6 +212,8 @@
 
     // osu!mania 列映射：x ∈ [0,512] → 列
     let col = Math.floor((x * keyCount) / 512);
+    if (col < 0) col = 0;
+    if (col >= keyCount) col = keyCount - 1;   // x=512 时 floor 会得到 keyCount，越界
     if (!isFinite(col)) col = 0;
     col = Math.max(0, Math.min(keyCount - 1, col));
 
@@ -278,6 +280,15 @@
 
       this.columns = [];
       for (let c = 0; c < this.keyCount; c++) this.columns.push([]);
+
+      // 进度条用：当前时间与曲子结束时间
+      this.time = 0;
+      this.endTime = 0;
+      for (let i = 0; i < chart.notes.length; i++) {
+        const e = (chart.notes[i].end !== null && chart.notes[i].end !== undefined)
+          ? chart.notes[i].end : chart.notes[i].time;
+        if (e > this.endTime) this.endTime = e;
+      }
 
       this.notes = chart.notes.map(function (n) {
         return {
@@ -413,6 +424,7 @@
      * @returns {Array} 事件列表
      */
     update(time) {
+      this.time = time;
       const events = [];
 
       for (let c = 0; c < this.keyCount; c++) {
@@ -442,9 +454,12 @@
       return events;
     }
 
-    /** 已判定 / 总数 */
+    /** 进度：按**时间**算（之前用的是「已判定 / 总数」，
+     *  谱面密度不均时进度条会忽快忽慢，和音乐对不上） */
     progress() {
-      return this.stats.total ? this.stats.judged / this.stats.total : 0;
+      if (!this.endTime) return 0;
+      const t = this.time || 0;
+      return Math.max(0, Math.min(1, t / this.endTime));
     }
 
     get accuracy() {

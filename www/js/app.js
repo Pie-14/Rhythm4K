@@ -8,7 +8,7 @@
   const $ = function (id) { return document.getElementById(id); };
 
   const STORE_KEY = 'rhythm4k.settings.v2';
-  const DEFAULTS = { offset: 0, scroll: 700, volume: 85, dim: 55, orientation: 'auto' };
+  const DEFAULTS = { offset: 0, scroll: 700, volume: 85, dim: 55, orientation: 'auto', autoPlay: false, sfxVolume: 130, bpmOverride: 0, useLocalBeats: false, beatServer: 'http://127.0.0.1:8737' };
   const SCREENS = ['menu', 'ready', 'pause', 'results', 'loading', 'calib'];
 
   const app = {
@@ -310,6 +310,25 @@
         await new Promise(function (r) { setTimeout(r, 40); });
 
         const analysis = M4K.autochart.analyze(toMono(buffer), buffer.sampleRate, {});
+      // 优先用本地节拍服务（beat_this，精度 0.01% 级）
+      if (M4K.autochart && analysis) {
+      const lb = (app.settings.useLocalBeats !== false && typeof fetch === "function")
+        ? await fetchLocalBeats(toMono(buffer), buffer.sampleRate) : null;
+        if (lb && lb.bpm > 0) {
+          // 本地服务擅长「拍子层级」，但精度差（实测中位误差 1.35%）。
+          // 用它给个起点，再用浏览器内的起音做精细拟合 + 整数吸附 → 精确值。
+          let bpm = lb.bpm, offMs = lb.offsetMs;
+          try {
+            const rb = M4K.autochart.refineBpm(analysis, lb.bpm);
+            if (rb) { bpm = rb.bpm; offMs = rb.offsetMs; }
+          } catch (e2) { /* 拟合失败就用服务的原值 */ }
+          analysis.bpm = bpm;
+          analysis.beatMs = 60000 / bpm;
+          analysis.offset = offMs;
+          analysis.beatsMs = lb.beatsMs;
+          analysis._localBeats = true;
+        }
+      }
         const chart = M4K.autochart.generate(analysis, {
           difficulty: 'normal',
           keyCount: 4,
@@ -473,10 +492,60 @@
     return out;
   }
 
+  /** Float32 单声道 → 16bit WAV（给本地节拍服务用） */
+  function encodeWavMono(mono, sr) {
+    const n = mono.length;
+    const buf = new ArrayBuffer(44 + n * 2);
+    const dv = new DataView(buf);
+    function ws(off, s) { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); }
+    ws(0, "RIFF"); dv.setUint32(4, 36 + n * 2, true); ws(8, "WAVE");
+    ws(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true);
+    dv.setUint16(22, 1, true); dv.setUint32(24, sr, true);
+    dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    ws(36, "data"); dv.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) {
+      let v = Math.max(-1, Math.min(1, mono[i]));
+      dv.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+    }
+    return buf;
+  }
+
+  /** 调本地节拍服务；不可用就返回 null（退回浏览器内估计） */
+  async function fetchLocalBeats(mono, sr) {
+    const url = app.settings.beatServer || "http://127.0.0.1:8737";
+    if (app.settings.useLocalBeats === false) return null;
+    // 没有 fetch / AbortController 的环境（测试、老浏览器）直接跳过
+    if (typeof fetch !== "function" || typeof AbortController !== "function") return null;
+    try {
+      const wav = encodeWavMono(mono, sr);
+      const ctrl = new AbortController();
+      const timer = setTimeout(function () { ctrl.abort(); }, 40000);
+      const res = await fetch(url + "/beats", {
+        method: "POST",
+        headers: { "content-type": "audio/wav" },
+        body: wav,
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) return null;
+      const j = await res.json();
+      if (!j || !j.ok) return null;
+      return j;
+    } catch (e) {
+      return null;
+    }
+  }
+
   function buildAutoChart(difficulty) {
     const a = app.autoAnalysis;
     if (!a) return null;
+    // 手动指定 BPM：覆盖检测结果（检测错时手动改对，立刻重新对齐网格）
+    if (app.settings.bpmOverride) {
+      a.bpm = app.settings.bpmOverride;
+      a.beatMs = 60000 / a.bpm;
+    }
     return M4K.autochart.generate(a, {
+      rhythm: 'beat',
       difficulty: difficulty,
       keyCount: 4,
       title: app.autoName || '自动生成',
@@ -504,6 +573,24 @@
     let analysis;
     try {
       analysis = M4K.autochart.analyze(toMono(buffer), buffer.sampleRate, {});
+
+    // 本地节拍服务（如果开着）：先问它要「拍子层级」，再用浏览器内的起音做精细拟合
+    try {
+      const lb = (app.settings.useLocalBeats !== false && typeof fetch === "function")
+        ? await fetchLocalBeats(toMono(buffer), buffer.sampleRate) : null;
+      if (lb && lb.bpm > 0) {
+        let bpm = lb.bpm, offMs = lb.offsetMs;
+        try {
+          const rb = M4K.autochart.refineBpm(analysis, lb.bpm);
+          if (rb) { bpm = rb.bpm; offMs = rb.offsetMs; }
+        } catch (e3) { /* 拟合失败就用服务的原值 */ }
+        analysis.bpm = bpm;
+        analysis.beatMs = 60000 / bpm;
+        analysis.offset = offMs;
+        analysis.beatsMs = lb.beatsMs;
+        analysis._localBeats = true;
+      }
+    } catch (e4) { /* 服务没开就走内置估计 */ }
     } catch (e) {
       show('menu');
       msg('分析失败：' + e.message);
@@ -587,7 +674,9 @@
       ['时长', formatTime(dur)],
     ];
     if (chart.auto) {
-      rows.push(['BPM', String(chart.auto.bpm)]);
+      if (app.autoName) rows.push(['文件', app.autoName]);
+      rows.push(['BPM', String(chart.auto.bpm) +
+        (chart.auto.version ? '　(分析器 v' + chart.auto.version + ')' : '　(分析器 v1)')]);
       rows.push(['节拍偏移', chart.auto.offset + ' ms']);
     } else {
       rows.push(['难度 OD', (chart.difficulty.OverallDifficulty || '—')]);
@@ -733,7 +822,7 @@
   function currentSong() {
     if (app.state === 'debug') return app.debugSong;
     if (app.state === 'results' && typeof app.frozenSong === 'number') return app.frozenSong;
-    if (app.state === 'playing' && app.lastFrame) return app.lastFrame.song;
+    if (app.state === 'playing' && app.lastFrame) return app.lastFrame.song;   // 画面时间（不含偏移）
     if (app.audio && app.audio.source) return app.audio.now() + app.settings.offset;
     return 0;
   }
@@ -741,23 +830,140 @@
   /* ------------------------------------------------------------------ *
    * 主循环
    * ------------------------------------------------------------------ */
+
+  /* ---------------- 自动演奏（试听用） ---------------- */
+  let autoQueue = [];      // 待释放的长条
+  let noiseBuf = null;
+
+  /** 白噪声缓冲（军鼓/镲的基础） */
+  function getNoise(ctx) {
+    if (noiseBuf) return noiseBuf;
+    const len = Math.floor(ctx.sampleRate * 0.4);
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    noiseBuf = buf;
+    return buf;
+  }
+
+  /** 取得（或创建）音效专用增益节点 */
+  function sfxGainNode() {
+    const ctx = app.audio.ctx;
+    if (!ctx) return null;
+    if (!app.sfxGain) {
+      const g = ctx.createGain();
+      g.gain.value = (app.settings.sfxVolume == null ? 130 : app.settings.sfxVolume) / 100;
+      g.connect(ctx.destination);
+      app.sfxGain = g;
+    }
+    return app.sfxGain;
+  }
+
+  /** 军鼓 / 镲。when 是 AudioContext 时刻（秒）；不传就是现在 */
+  function playHitSound(col, isHoldEnd, when) {
+    const ctx = app.audio.ctx;
+    if (!ctx || !ctx.createBufferSource) return;
+    const dest = sfxGainNode();
+    if (!dest) return;
+    const vol = 1.0;
+    const t0 = Math.max(ctx.currentTime, (when != null ? when : ctx.currentTime));
+    const buf = getNoise(ctx);
+
+    // 噪声层：军鼓带通中频，镲高频
+    if (!ctx.createBufferSource || !ctx.createBuffer) return;
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    let node = src;
+    if (ctx.createBiquadFilter) {
+      const bp = ctx.createBiquadFilter();
+      bp.type = isHoldEnd ? "highpass" : "bandpass";
+      bp.frequency.value = isHoldEnd ? 6500 : 2900;
+      bp.Q.value = isHoldEnd ? 0.7 : 0.9;
+      src.connect(bp);
+      node = bp;
+    }
+    const g = ctx.createGain();
+    const peak = (isHoldEnd ? 0.7 : 1.0) * vol;
+    const dur = isHoldEnd ? 0.2 : 0.085;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(peak, t0 + 0.002);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    node.connect(g); g.connect(dest);
+    src.start(t0);
+    src.stop(t0 + dur + 0.02);
+
+    // 鼓身层：军鼓有个低频「咚」，镲没有
+    if (!isHoldEnd) {
+      const osc = ctx.createOscillator();
+      const og = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(330, t0);
+      osc.frequency.exponentialRampToValueAtTime(210, t0 + 0.05);
+      og.gain.setValueAtTime(0.0001, t0);
+      og.gain.exponentialRampToValueAtTime(0.62 * vol, t0 + 0.003);
+      og.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.08);
+      osc.connect(og); og.connect(dest);
+      osc.start(t0); osc.stop(t0 + 0.1);
+    }
+  }
+
+  /** 每帧调用：提前调度音效（补偿输出延迟），到点再判定 */
+  function autoPlayStep(song) {
+    if (!app.settings.autoPlay || !app.engine) return;
+    const notes = app.engine.notes || [];
+    const lat = (app.audio.latency ? app.audio.latency() : 0);
+    const lookahead = lat + 120;     // 提前量：够覆盖输出延迟 + 一帧抖动
+    for (let i = 0; i < notes.length; i++) {
+      const n = notes[i];
+      if (n.state !== "pending") continue;
+
+      // ① 音效：提前排进音频时钟，这样「听到的时刻」正好是音符时刻
+      if (!n._sched && n.time <= song + lookahead) {
+        n._sched = true;
+        const at = app.audio.ctxTimeForSong(n.time) - lat / 1000;
+        playHitSound(n.col, false, at);
+        if (n.isHold && n.end) autoQueue.push({ col: n.col, at: n.end, sched: false });
+      }
+
+      // ② 判定：到点才按（帧精度够了，判定窗口很宽）
+      if (n.time <= song && song - n.time <= 90) {
+        app.engine.press(n.col, n.time);
+      }
+    }
+    for (let i = autoQueue.length - 1; i >= 0; i--) {
+      const q = autoQueue[i];
+      if (song >= q.at) {
+        app.engine.release(q.col, q.at);
+        autoQueue.splice(i, 1);
+      }
+    }
+  }
+
+  app.autoPlayStep = autoPlayStep;
+  app.playHitSound = playHitSound;
+
   function loop(now) {
     requestAnimationFrame(loop);
 
     if (app.state === 'playing') {
-      const song = app.audio.now() + app.settings.offset;
-      app.lastFrame = { perf: now, song: song };
+      // 自动演奏时忽略判定偏移，否则击打音会和人听到的音乐错位
+      // 判定用时间（含判定偏移）；画面用时间不含偏移——
+      // 否则调偏移时音符和判定一起动，主观上几乎感觉不到变化。
+      const songRaw = app.audio.now();
+      const song = songRaw + (app.settings.autoPlay ? 0 : app.settings.offset);
+      app.lastFrame = { perf: now, song: songRaw, judge: song };
 
+      autoPlayStep(song);
       const events = app.engine.update(song);
       for (let i = 0; i < events.length; i++) {
         if (events[i].type === 'miss') app.renderer.flash(M4K.JUDGEMENTS.miss);
         else if (events[i].type === 'holdbreak') app.renderer.flash(M4K.JUDGEMENTS.miss);
       }
 
-      syncVideo(song);
+      syncVideo(songRaw);   // 视频跟画面时间，不受判定偏移影响
       if (app.media.flv) {
         const p = app.media.flv;
-        p.update(song - (app.chart.videoStart || 0));
+        p.update(songRaw - (app.chart.videoStart || 0));
         if (p.failed) {
           fallbackToImage();
         } else if (!p.canvas || p.canvas.width === 0) {
@@ -902,21 +1108,54 @@
     $('btnCalibApply').disabled = false;
 
     const sign = r.offset >= 0 ? '+' : '';
-    let text = '平均偏差 ' + sign + Math.round(r.offset) + ' ms（波动 ' + Math.round(r.spread) + ' ms）';
-    if (r.spread > 70) text += '　波动偏大，建议重来一次';
+    // 直接把「应用后会变成多少」写出来：
+    // 用户看到偏差 +40，而设置里变成 -40（旧值减偏差），很容易以为没生效。
+    const before = app.settings.offset;
+    // 偏差是绝对值（不随上一次设置累加），直接取相反数
+    const raw = Math.round(-r.offset);
+    const after = clampOffset(raw);
+    let text = '平均偏差 ' + sign + Math.round(r.offset) + ' ms（波动 ' + Math.round(r.spread) + ' ms）'
+      + '\n应用后判定偏移：' + before + ' → ' + after + ' ms'
+      + (raw !== after ? '（需 ' + raw + ' ms，超出 ±500 已截断）' : '')
+      + '\n判定偏移只影响判定时机，不会挪动音符';
+    if (r.spread > 70) text += '\n波动偏大，建议重来一次';
     if (Math.abs(r.offset) > 250) {
-      text += '　偏差异常大——先确认没有戴着蓝牙耳机，或者上一轮的提示音还在响';
+      text += '\n偏差异常大——先确认没有戴着蓝牙耳机，或者上一轮的提示音还在响';
     }
     $('calibInfo').textContent = text;
   }
 
+  function clampOffset(v) {
+    const n = Math.round(Number(v));
+    if (!isFinite(n)) return 0;
+    return Math.max(-500, Math.min(500, n));
+  }
+
   function applyCalibration() {
     if (!calib || !calib.result) return;
-    const next = Math.max(-300, Math.min(300, Math.round(app.settings.offset - calib.result.offset)));
+    if (!isFinite(calib.result.offset)) {
+      $('calibInfo').textContent = '这次没测到有效敲击，请重来一次';
+      return;
+    }
+    const before = app.settings.offset;
+    const next = clampOffset(before - calib.result.offset);
     app.settings.offset = next;
     saveSettings();
-    $('setOffset').value = next;
+
+    const input = $('setOffset');
+    if (input) input.value = next;
+
     endCalibration();
+
+    // 回到准备页后给一句确认，避免「以为没生效」
+    const hint = $('readyMeta');
+    if (hint) {
+      const was = hint.textContent;
+      hint.textContent = was + '　|　已应用判定偏移 ' + next + ' ms（原 ' + before + '）';
+      setTimeout(function () {
+        if (hint.textContent.indexOf('已应用判定偏移') >= 0) hint.textContent = was;
+      }, 6000);
+    }
   }
 
   function endCalibration() {
@@ -1027,7 +1266,7 @@
   function judgeTimeForEvent(timeStamp) {
     const lf = app.lastFrame;
     if (!lf) return app.audio.now() + app.settings.offset;
-    return lf.song + (timeStamp - lf.perf);
+    return (lf.judge != null ? lf.judge : lf.song) + (timeStamp - lf.perf);
   }
 
   function onKeyDown(e) {
@@ -1237,8 +1476,32 @@
     syncOrientationUi();
       saveSettings();
     });
+    $('setSfx').addEventListener('input', function (e) {
+      app.settings.sfxVolume = Math.round(Number(e.target.value) || 0);
+      if (app.sfxGain) app.sfxGain.gain.value = app.settings.sfxVolume / 100;
+      saveSettings();
+    });
+    $('bpmOverride').addEventListener('change', function (e) {
+      const v = Number(e.target.value);
+      app.settings.bpmOverride = (v >= 30 && v <= 400) ? v : 0;
+      saveSettings();
+    });
     $('setDim').addEventListener('input', function (e) {
       app.settings.dim = Math.round(Number(e.target.value) || 0);
+      saveSettings();
+    });
+    $('setAuto').addEventListener('change', function (e) {
+      app.settings.autoPlay = !!e.target.checked;
+      autoQueue = [];
+      if (app.settings.autoPlay) {
+        // 自动演奏时判定偏移会让音效和音乐错位，先归零（记住原值，关掉后恢复）
+        app._autoPrevOffset = app.settings.offset;
+        app.settings.offset = 0;
+      } else if (app._autoPrevOffset != null) {
+        app.settings.offset = app._autoPrevOffset;
+        app._autoPrevOffset = null;
+      }
+      $('setOffset').value = app.settings.offset;
       saveSettings();
     });
 
@@ -1320,7 +1583,10 @@
     $('setOffset').value = app.settings.offset;
     $('setScroll').value = app.settings.scroll;
     $('setVolume').value = app.settings.volume;
+    $('setSfx').value = app.settings.sfxVolume == null ? 130 : app.settings.sfxVolume;
+    $('bpmOverride').value = app.settings.bpmOverride ? app.settings.bpmOverride : '';
     $('setDim').value = app.settings.dim;
+    $('setAuto').checked = !!app.settings.autoPlay;
     app.audio.setVolume(app.settings.volume / 100);
     syncOrientationUi();
   }

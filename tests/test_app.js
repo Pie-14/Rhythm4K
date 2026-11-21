@@ -39,7 +39,7 @@ function check(name, cond, extra) {
   await stub.flush(200);
 
   check('进入准备页', !stub.isHidden('screen-ready'));
-  check('曲名正确', stub.el('readyTitle').textContent === 'Neon Tutorial', stub.el('readyTitle').textContent);
+  check('曲名正确', stub.el('readyTitle').textContent === 'NEON OVERDRIVE', stub.el('readyTitle').textContent);
   check('谱面 4K', app.chart.keyCount === 4);
   check('生成了解码后的音频', !!app.audioBuffer && app.audioBuffer.duration > 20, app.audioBuffer && app.audioBuffer.duration);
   const statText = stub.el('readyStats').children.map(c => c.children[1].textContent);
@@ -201,6 +201,81 @@ function check(name, cond, extra) {
   check('换难度后重新生成', app.chart.auto && app.chart.auto.difficulty === 'hard', app.chart.auto);
   check('困难版音符不少于普通版', app.chart.notes.length >= before, { before, after: app.chart.notes.length });
 
+  /* ---------- 10b. 竖屏 + 触控按钮 ---------- */
+  {
+    const dbg = globalThis.__rhythm4kDebug;
+    dbg.setOrientation('portrait');
+    check('切到竖屏', app.renderer.W === 1080 && app.renderer.H === 1920,
+      [app.renderer.W, app.renderer.H]);
+    check('方向写进设置', app.settings.orientation === 'portrait', app.settings.orientation);
+
+    const canvas = stub.el('scene');
+    canvas.clientWidth = 1080;
+    canvas.clientHeight = 1920;
+    app.renderer.resize();
+
+    const r = app.renderer;
+    const lane = 2;
+    const lx = r.fieldX + lane * (r.laneW + r.gap) + r.laneW / 2;
+    const ly = r.judgeY + 140;
+
+    const down = (canvas._listeners['pointerdown'] || [])[0];
+    const up = (canvas._listeners['pointerup'] || [])[0];
+    check('画布上绑了 pointerdown', typeof down === 'function');
+    check('画布上绑了 pointerup', typeof up === 'function');
+
+    const ev = (x, y, id) => ({
+      pointerType: 'touch', pointerId: id, clientX: x, clientY: y,
+      timeStamp: 0, preventDefault() {},
+    });
+
+    const realState = app.state;
+    app.state = 'playing';
+    app.keysDown = app.keysDown.map(() => false);
+
+    down(ev(lx, ly, 1));
+    check('触控按下点亮轨道', app.keysDown[lane] === true, app.keysDown);
+    up(ev(lx, ly, 1));
+    check('触控抬起熄灭轨道', app.keysDown[lane] === false, app.keysDown);
+
+    down(ev(r.fieldX - 50, ly, 2));
+    check('点在轨道外不触发', app.keysDown.indexOf(true) < 0, app.keysDown);
+    up(ev(r.fieldX - 50, ly, 2));
+
+    down(ev(lx, ly, 3));
+    down(ev(lx, ly, 4));
+    up(ev(lx, ly, 3));
+    check('同轨还有手指按着时保持按住', app.keysDown[lane] === true);
+    up(ev(lx, ly, 4));
+    check('最后一指松开才熄灭', app.keysDown[lane] === false);
+
+    app.state = realState;
+    dbg.setOrientation('landscape');
+    check('切回横屏', app.renderer.W === 1920 && app.renderer.H === 1080);
+  }
+
+  /* ---------- 10c. 示例曲资源 404 时不能弹错误框 ---------- */
+  {
+    // 模拟部署到 GitHub Pages：www/audio/ 被排除了，请求返回 404 的 HTML
+    const html = new TextEncoder().encode(
+      '<!DOCTYPE html><html><head><title>404</title></head><body>Not Found</body></html>'.repeat(120)
+    );
+    globalThis.fetch = async function () {
+      return { arrayBuffer: async function () { return html.buffer; } };
+    };
+
+    stub.click('btnDemo');
+    await stub.flush(400);
+
+    check('资源是 HTML 时不交给解码器（走合成曲）', app.demoFallback === true, app.demoFallback);
+    check('404 之后仍然进得了准备页', app.state === 'ready', app.state);
+    // bootError 用的是 HTML 的 hidden 属性，不是 class，所以看文本有没有被写入
+    check('404 不弹错误横幅', !(stub.el('bootError') || {}).textContent,
+      (stub.el('bootError') || {}).textContent);
+
+    delete globalThis.fetch;
+  }
+
   /* ---------- 11. 延迟校准 ---------- */
   stub.click('btnCalib');
   await stub.flush(150);
@@ -234,6 +309,24 @@ function check(name, cond, extra) {
       before, after: app.settings.offset, measured: c.result.offset,
     });
     check('应用后回到准备页', app.state === 'ready', app.state);
+
+    // ---- 自动演奏（试听模式）----
+    app.settings.autoPlay = true;
+    app.engine = new M4K.Engine(app.chart);
+    const totalNotes = app.chart.notes.length;
+    app.autoPlayStep(app.chart.notes[0].time);
+    const firstNote = app.engine.notes[0];
+    check('自动演奏会按下第一个音', firstNote.state === 'hit' || firstNote.state === 'holding',
+      firstNote.state);
+    // 推进到全曲结束，所有音都该被自动打掉
+    const lastT = app.chart.notes[app.chart.notes.length - 1].time + 500;
+    for (let tt = 0; tt <= lastT; tt += 8) app.autoPlayStep(tt);
+    app.engine.update(lastT);
+    check('自动演奏没有漏音', app.engine.stats.miss === 0,
+      { miss: app.engine.stats.miss, total: totalNotes });
+    check('自动演奏打完了所有音', app.engine.stats.judged === totalNotes,
+      { judged: app.engine.stats.judged, total: totalNotes });
+    app.settings.autoPlay = false;
   }
 
   console.log('');

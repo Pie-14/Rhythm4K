@@ -41,8 +41,9 @@ class FakeCtx {
   }
   _rec(name, args, meta) { this.ops.push({ name, args: Array.prototype.slice.call(args), meta: meta || {} }); }
   setTransform() {}
-  save() {}
-  restore() {}
+  save() { this._rec('save', []); }
+  restore() { this._rec('restore', []); }
+  translate(x, y) { this._rec('translate', [x, y]); }
   beginPath() {}
   closePath() {}
   moveTo(x, y) { this._rec('moveTo', [x, y]); }
@@ -68,6 +69,12 @@ class FakeCanvas {
     this.ctx = new FakeCtx();
   }
   getContext() { return this.ctx; }
+  getBoundingClientRect() {
+    return {
+      left: 0, top: 0, right: this.clientWidth, bottom: this.clientHeight,
+      width: this.clientWidth, height: this.clientHeight,
+    };
+  }
 }
 
 globalThis.devicePixelRatio = 1;
@@ -311,6 +318,86 @@ const chart = core.parseOsu(demo.text);
   // 头已经不在了：判定线上的音符头不应再出现
   check('断掉后不再画音符头', findMove(ops, nx + 10, 900 - r.noteH / 2).length <= 2,
     findMove(ops, nx + 10, 900 - r.noteH / 2).length);
+}
+
+/* ---------------- 5c. 竖屏（手机）布局 ---------------- */
+{
+  const canvas = new FakeCanvas(1080, 1920);
+  const r = new globalThis.M4K.Renderer(canvas);
+  const beforeW = r.W;
+  r.setOrientation('portrait');
+
+  check('竖屏切换后逻辑尺寸 1080×1920', r.W === 1080 && r.H === 1920, [r.W, r.H]);
+  check('横屏时是 1920×1080', beforeW === 1920, beforeW);
+  check('竖屏轨道居中', Math.abs(r.fieldX - (1080 - r.fieldW) / 2) < 1.5, {
+    fieldX: r.fieldX, fieldW: r.fieldW,
+  });
+  check('竖屏判定线在下方 78%', Math.abs(r.judgeY - 1920 * 0.78) < 2, r.judgeY);
+  check('竖屏轨道不超出画布', r.fieldX >= 0 && r.fieldX + r.fieldW <= 1080, {
+    left: r.fieldX, right: r.fieldX + r.fieldW, W: r.W,
+  });
+
+  // 底部按钮点中哪条轨道
+  const y = r.judgeY + 120;
+  check('点第 1 轨中心 → 0', r.laneAt(r.fieldX + r.laneW / 2, y) === 0);
+  check('点第 4 轨中心 → 3',
+    r.laneAt(r.fieldX + 3 * (r.laneW + r.gap) + r.laneW / 2, y) === 3);
+  check('点左侧空白 → -1', r.laneAt(r.fieldX - 40, y) === -1);
+  check('点右侧空白 → -1', r.laneAt(r.fieldX + r.fieldW + 40, y) === -1);
+  // 整条竖条都算（手机手指不需要精确到底部按钮）
+  check('整条轨道都能点（顶部也算）', r.laneAt(r.fieldX + 10, 40) === 0);
+  check('判定线上方很远处也能点', r.laneAt(r.fieldX + 10, r.judgeY - r.noteH * 5) === 0);
+  check('画布下方之外不算', r.laneAt(r.fieldX + 10, r.H + 5) === -1);
+
+  // 坐标换算：画布 CSS 尺寸 = 逻辑尺寸时应当一比一
+  canvas.clientWidth = 1080;
+  canvas.clientHeight = 1920;
+  canvas.width = 1080;
+  canvas.height = 1920;
+  r.resize();
+  const p = r.logicalPoint(200, 300);
+  check('逻辑坐标换算（无缩放）', Math.abs(p.x - 200) < 2 && Math.abs(p.y - 300) < 2, p);
+
+  // 竖屏也要能正常画一帧
+  r.setChart(chart);
+  const engine = new core.Engine(chart);
+  const st = { engine, songTime: chart.notes[0].time, keysDown: [false, false, false, false], scrollMs: 700, chart };
+  let threw = null;
+  try { r.draw(st); } catch (e) { threw = e.message; }
+  check('竖屏绘制不报错', threw === null, threw);
+
+  // 切回横屏
+  r.setOrientation('landscape');
+  check('切回横屏恢复 1920×1080', r.W === 1920 && r.H === 1080, [r.W, r.H]);
+  check('切回横屏判定线回 900', Math.abs(r.judgeY - 900) < 2, r.judgeY);
+}
+
+/* ---------------- 5d. 默认背景是动态的 ---------------- */
+{
+  const canvas = new FakeCanvas(1920, 1080);
+  const r = new globalThis.M4K.Renderer(canvas);
+  r.setChart(chart);
+  const engine = new core.Engine(chart);
+  const st = { engine, songTime: 0, keysDown: [false, false, false, false], scrollMs: 700, chart, media: null };
+
+  canvas.ctx.ops.length = 0;
+  r.draw(st);
+  const ops1 = canvas.ctx.ops.slice();
+  const translate1 = ops1.filter(o => o.name === 'translate').map(o => o.args[0].toFixed(3));
+  check('默认背景画了光晕（有 translate 位移）', translate1.length >= 2, translate1);
+
+  // 时间推进后再画一帧，位移应当变化
+  r.bgT = 0;
+  r._lastNow = 1;
+  canvas.ctx.ops.length = 0;
+  r.draw(st);
+  const t0 = canvas.ctx.ops.filter(o => o.name === 'translate').map(o => o.args[0].toFixed(3));
+  r.bgT = 5;
+  r._lastNow = 1;
+  canvas.ctx.ops.length = 0;
+  r.draw(st);
+  const t5 = canvas.ctx.ops.filter(o => o.name === 'translate').map(o => o.args[0].toFixed(3));
+  check('背景光晕会随时间移动', JSON.stringify(t0) !== JSON.stringify(t5), { t0, t5 });
 }
 
 /* ---------------- 6. 背景图（cover + 压暗） ---------------- */

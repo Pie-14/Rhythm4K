@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -49,7 +49,7 @@
         <div id="chartList" class="chart-list hidden"></div>
         <p id="menuMsg" class="msg"></p>
         <p class="hint">键位 <kbd>D</kbd><kbd>F</kbd><kbd>J</kbd><kbd>K</kbd> · <kbd>空格</kbd> 开始 · <kbd>Esc</kbd> 暂停 · <kbd>F11</kbd> 全屏</p>
-        <p class="ver">v0.3.0</p>
+        <p class="ver">v0.4.0</p>
       </div>
     </section>
 
@@ -62,10 +62,12 @@
         <dl id="readyStats" class="stats"></dl>
 
         <div class="settings">
-          <label>判定偏移 <input id="setOffset" type="number" step="1" min="-300" max="300"> ms</label>
+          <label>判定偏移 <input id="setOffset" type="number" step="1" min="-500" max="500"> ms</label>
           <label>音符下落时长 <input id="setScroll" type="number" step="50" min="300" max="1600"> ms</label>
           <label>背景暗度 <input id="setDim" type="range" min="0" max="95"></label>
-          <label>音量 <input id="setVolume" type="range" min="0" max="100"></label>
+          <label>音乐音量 <input id="setVolume" type="range" min="0" max="100"></label>
+          <label>音效音量 <input id="setSfx" type="range" min="0" max="200"></label>
+          <label class="chk"><input id="setAuto" type="checkbox"> 自动演奏（试听，每个音符带击打音）</label>
           <button id="btnCalib" class="btn">延迟校准…</button>
         </div>
         <p class="hint">偏移：判定偏早调负、偏晚调正；通常 0 附近。改完自动保存。</p>
@@ -77,6 +79,9 @@
               <option value="normal">普通</option>
               <option value="hard">困难</option>
             </select>
+          </label>
+          <label>BPM（留空自动）
+            <input id="bpmOverride" class="num" type="number" min="30" max="400" step="0.5" placeholder="auto">
           </label>
           <button id="btnExport" class="btn">导出 .osu</button>
           <button id="btnReport" class="btn">导出分析报告</button>
@@ -178,6 +183,8 @@
 <script src="js/core.js"></script>
 <script src="js/audio.js"></script>
 <script src="js/demo.js"></script>
+<script src="js/seqmodel.js"></script>
+<script src="js/stage2.js"></script>
 <script src="js/autochart.js"></script>
 <script src="js/flv.js"></script>
 <script src="js/render.js"></script>

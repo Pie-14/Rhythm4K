@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>背景预览</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<script src="../www/js/core.js"></script>
+<script src="../www/js/render.js"></script>
+<script>
+(function () {
+  const portrait = new URLSearchParams(location.search).get('p') === '1';
+  const W = portrait ? 1080 : 1920;
+  const H = portrait ? 1920 : 1080;
+
+  const canvas = document.getElementById('scene');
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+
+  // ?zoom=3&zx=1100&zy=600 用来放大看某个区域
+  const qs = new URLSearchParams(location.search);
+  const z = Number(qs.get('zoom') || 1);
+  if (z > 1) {
+    const zx = Number(qs.get('zx') || W / 2);
+    const zy = Number(qs.get('zy') || H / 2);
+    canvas.style.transformOrigin = zx + 'px ' + zy + 'px';
+    canvas.style.transform = 'scale(' + z + ')';
+  }
+
+  const r = new M4K.Renderer(canvas);
+  if (portrait) r.setOrientation('portrait');
+
+  // 造一个假谱面：几颗普通音符 + 一条长条，方便看层次
+  const notes = [];
+  const lanes = [0, 1, 2, 3, 1, 2, 0, 3, 2, 1];
+  for (let i = 0; i < lanes.length; i++) {
+    notes.push({
+      id: i, time: 1000 + i * 130, col: lanes[i], end: null,
+      isHold: false, state: 'pending',
+    });
+  }
+  notes.push({
+    id: 99, time: 1500, col: 3, end: 2600, isHold: true, state: 'pending',
+  });
+  notes.sort((a, b) => a.time - b.time);
+
+  const chart = {
+    meta: { title: 'Preview', artist: '', version: '', creator: '' },
+    keyCount: 4, notes, audioFilename: '',
+  };
+  r.setChart(chart);
+
+  const engine = new M4K.Engine(chart);
+  // 让音符分布在判定线附近，看起来像在打歌
+  const songTime = notes[0].time + 380;
+  engine.update(songTime);
+
+
+  r.draw({
+    engine,
+    songTime,
+    keysDown: [false, true, false, false],
+    scrollMs: 700,
+    duration: 4000,
+    chart,
+    media: null,
+    bgDim: 0.55,
+  });
+})();
+</script>
+</body>
+</html>

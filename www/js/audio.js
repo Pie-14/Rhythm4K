@@ -78,6 +78,16 @@
     /**
      * 当前歌曲位置（毫秒）。已经把输出延迟扣掉，等于"耳朵听到的位置"。
      */
+    /** 某个「歌曲时刻(ms)」对应的 AudioContext 时刻(秒)。
+     *  用于提前调度音效，避免输出延迟导致的错位。 */
+    ctxTimeForSong(songMs) {
+      if (!this.ctx || !this.startedAt) return 0;
+      return this.startedAt + (songMs - this.baseOffset * 1000) / 1000;
+    }
+
+    /** 输出延迟（毫秒）：音效要被听到，必须比 ctx 时刻再提前这么多 */
+    latency() { return this.latencyMs || 0; }
+
     now() {
       if (!this.ctx || !this.source) return 0;
       const elapsed = this.ctx.currentTime - this.startedAt;

@@ -38,6 +38,14 @@ function makeElement(id, tag) {
     appendChild(c) { el.children.push(c); return c; },
     addEventListener(t, fn) { (el._listeners[t] = el._listeners[t] || []).push(fn); },
     removeEventListener() {},
+    getBoundingClientRect() {
+      return {
+        left: 0, top: 0, right: el.clientWidth, bottom: el.clientHeight,
+        width: el.clientWidth, height: el.clientHeight,
+      };
+    },
+    setPointerCapture() {},
+    releasePointerCapture() {},
     removeAttribute() {},
     load() {},
     play() { el.paused = false; return { catch() {} }; },
@@ -75,6 +83,7 @@ function install(htmlRelPath) {
     ops: [],
     fillStyle: '', strokeStyle: '', lineWidth: 1, font: '', textAlign: '', textBaseline: '', globalAlpha: 1,
     setTransform() {}, save() {}, restore() {}, beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
+    translate() {}, rotate() {}, scale() {},
     quadraticCurveTo() {}, arc() {}, fill() {}, stroke() {}, clearRect() {}, fillRect() {}, fillText() {},
     createLinearGradient() { return new Gradient(); },
     createRadialGradient() { return new Gradient(); },
@@ -120,6 +129,8 @@ function install(htmlRelPath) {
 
   /* ---- localStorage ---- */
   const store = {};
+  // 测试环境不要访问本地节拍服务（Node 自带 fetch，会把真服务请求进去）
+  store['rhythm4k.settings.v2'] = JSON.stringify({ useLocalBeats: false });
   globalThis.localStorage = {
     getItem: k => (k in store ? store[k] : null),
     setItem: (k, v) => { store[k] = String(v); },
@@ -147,56 +158,59 @@ function install(htmlRelPath) {
       };
       return { gain: param, connect() { return this; }, disconnect() {} };
     }
+    createBufferSource() {
+      return { buffer: null, connect() { return this; }, start() {}, stop() {} };
+    }
+    createBuffer(ch, len, sr) {
+      const sampleRate = sr || 44100;
+      const data = new Float32Array(len);
+      return {
+        numberOfChannels: ch,
+        length: len,
+        sampleRate: sampleRate,
+        duration: len / sampleRate,
+        getChannelData: () => data,
+        copyToChannel(src) {
+          if (!src) return;
+          const n = Math.min(src.length || 0, len);
+          for (let i = 0; i < n; i++) data[i] = src[i];
+        },
+      };
+    }
+    createBiquadFilter() {
+      return { type: "lowpass", frequency: { value: 0 }, Q: { value: 1 },
+               connect() { return this; } };
+    }
     createOscillator() {
       return {
-        type: 'sine',
-        frequency: { value: 440 },
+        type: "sine",
+        frequency: { value: 440, setValueAtTime() {}, exponentialRampToValueAtTime() {} },
         connect() { return this; },
         disconnect() {},
         start() {},
         stop() {},
       };
     }
-    createBufferSource() {
-      return {
-        buffer: null, onended: null,
-        connect() { return this; }, disconnect() {},
-        start() { this.started = true; }, stop() { this.stopped = true; },
-      };
+    decodeAudioData(buf, ok) {
+      // 造一段 150 BPM 的测试信号（每 0.4 秒一个脉冲），让自动生成流程能跑出 BPM=150
+      const sr = 22050;
+      const dur = 32;
+      const out = this.createBuffer(1, dur * sr, sr);
+      const d = out.getChannelData(0);
+      for (let i = 0; i < d.length; i++) {
+        const tSec = i / sr;
+        const ph = tSec % 0.4;
+        if (ph < 0.012) {
+          const env = 1 - ph / 0.012;
+          d[i] = Math.sin(2 * Math.PI * 180 * ph) * env * 0.85
+               + Math.sin(2 * Math.PI * 2400 * ph) * env * 0.25;
+        }
+      }
+      if (typeof ok === 'function') ok(out);
+      return Promise.resolve(out);
     }
-    async resume() { this.state = 'running'; }
-    async suspend() { this.state = 'suspended'; }
-    decodeAudioData(buf, ok, err) {
-      // 返回一段 8 秒、150BPM 的合成鼓点，这样自动生成谱面也有真实输入可用
-      setTimeout(() => {
-        try {
-          const sr = this.sampleRate;
-          const len = Math.round(sr * 8);
-          const out = this.createBuffer(2, len, sr);
-          const beat = 0.4; // 150 BPM
-          for (let ch = 0; ch < 2; ch++) {
-            const d = out.getChannelData(ch);
-            for (let t = 0; t < 7.6; t += beat) {
-              const s = Math.floor(t * sr);
-              const n = Math.floor(sr * 0.09);
-              for (let i = 0; i < n && s + i < len; i++) {
-                const env = Math.exp(-i / (sr * 0.02));
-                d[s + i] += Math.sin(2 * Math.PI * 60 * i / sr) * env * 0.8;
-              }
-            }
-          }
-          ok(out);
-        } catch (e) { if (err) err(e); }
-      }, 0);
-    }
-    createBuffer(channels, len, sr) {
-      const data = [];
-      for (let i = 0; i < channels; i++) data.push(new Float32Array(len));
-      return {
-        numberOfChannels: channels, length: len, sampleRate: sr, duration: len / sr,
-        getChannelData: i => data[i],
-      };
-    }
+    resume() { this.state = 'running'; return Promise.resolve(); }
+    suspend() { this.state = 'suspended'; return Promise.resolve(); }
   }
   globalThis.AudioContext = FakeAudioContext;
   globalThis.webkitAudioContext = FakeAudioContext;

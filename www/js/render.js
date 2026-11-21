@@ -449,7 +449,9 @@
       for (let i = start; i < notes.length; i++) {
         const n = notes[i];
         if (n.time > hi) break;
-        if (n.state !== 'pending' && n.state !== 'holding') continue;
+        // MISS 的长条：头已经不在了，但身体应该继续变暗画出来，而不是整条消失
+        var ghostHold = (n.isHold && n.state === 'missed' && n.end && n.end > this.songTime - 150);
+        if (n.state !== 'pending' && n.state !== 'holding' && !ghostHold) continue;
         this._drawNote(ctx, n);
         drawn.add(n.id);
       }
@@ -479,6 +481,7 @@
       const hue = this.hueOf(n.col);
       const holding = n.state === 'holding';
       const broken = n.state === 'broken';
+      const ghost = n.state === 'missed';          // 头没接住：身体变暗继续画
       const headY = (holding || broken) ? this.judgeY : this.yFor(n.time);
       const nx = x + this.noteInset;
       const nw = this.laneW - this.noteInset * 2;
@@ -490,7 +493,7 @@
         const top = Math.min(tailY, headY);
         const bottom = Math.max(tailY, headY);
         if (bottom > -80 && top < this.H + 80 && bottom - top > 1) {
-          const bodyAlpha = broken ? 0.30 : (holding ? 0.55 : 0.68);
+          const bodyAlpha = (broken || ghost) ? 0.30 : (holding ? 0.55 : 0.68);
           ctx.fillStyle = 'hsla(' + hue + ', 74%, 54%, ' + bodyAlpha + ')';
           roundRect(ctx, nx, top, nw, bottom - top, 7);
           ctx.fill();
@@ -509,7 +512,7 @@
       }
 
       // 断掉的：头已经不在了，只画剩下那截身体
-      if (broken) return;
+      if (broken || ghost) return;
 
       // 头部
       if (headY < -nh || headY > this.H + nh) return;

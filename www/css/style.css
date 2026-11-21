@@ -262,3 +262,40 @@ kbd {
   .stats { grid-template-columns: 1fr 1fr; }
   #grade { font-size: 64px; }
 }
+
+/* 标题/文件名过长时不撑破布局 */
+#readyTitle, #resultTitle {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  word-break: break-all;
+}
+.field-value, .kv .v, .row .v {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+html, body { overflow-x: hidden; }
+
+/* 长文件名/长标题：一律截断，别撑破卡片 */
+.card { overflow-x: hidden; }
+.stats div { min-width: 0; }
+.stats dt { flex: 0 0 auto; white-space: nowrap; }
+.stats dd {
+  min-width: 0;
+  flex: 1 1 auto;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: ltr;
+}
+.stats dd.wrap-name {
+  white-space: normal;
+  word-break: break-all;
+  text-align: left;
+  max-height: 3.2em;
+  overflow: hidden;
+}

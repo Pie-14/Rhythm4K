@@ -21,6 +21,10 @@
 
   const FRAME = 128; // 包络分帧的采样数（22kHz 下约 5.8ms）
 
+  // 分析器版本：改了测速 / 密度 / 配比逻辑就 +1，准备页会显示出来
+  const ANALYZER_VERSION = 5;
+  let CURRENT_ABL = {};   // 消融开关（只在评测时用）
+
   /* ---------------- 工具 ---------------- */
 
   function mulberry32(seed) {
@@ -35,18 +39,35 @@
   }
 
   /** 整数倍降采样到目标采样率附近（简单的滑动平均，够用） */
+  /**
+   * 重采样到固定目标采样率。
+   *
+   * 注意：这里必须做**抗混叠滤波 + 非整数比重采样**。
+   * 早期版本用整数倍抽取（factor = round(sr/22050)），48kHz 时算出 2 倍，
+   * 输出变成 24kHz 且没有低通——高频折返进 5kHz 以上的频段，
+   * 测速会直接错（实测 200 BPM 的歌被判成 149.8）。
+   */
   function decimate(samples, sampleRate, targetRate) {
-    const factor = Math.max(1, Math.round(sampleRate / targetRate));
-    if (factor === 1) return { data: samples, sampleRate: sampleRate };
-    const n = Math.floor(samples.length / factor);
+    if (sampleRate <= targetRate) return { data: samples, sampleRate: sampleRate };
+
+    // 抗混叠：两级低通，截止到目标奈奎斯特的 84%
+    const cutoff = targetRate * 0.42;
+    const c = biquadCoeffs('lowpass', cutoff, 0.707, sampleRate);
+    let src = applyBiquad(samples, c);
+    src = applyBiquad(src, c);
+
+    const ratio = sampleRate / targetRate;
+    const n = Math.floor(samples.length / ratio);
     const out = new Float32Array(n);
     for (let i = 0; i < n; i++) {
-      let s = 0;
-      const base = i * factor;
-      for (let k = 0; k < factor; k++) s += samples[base + k];
-      out[i] = s / factor;
+      const pos = i * ratio;
+      const i0 = pos | 0;
+      const frac = pos - i0;
+      const a = src[i0] || 0;
+      const b = src[i0 + 1] !== undefined ? src[i0 + 1] : a;
+      out[i] = a + (b - a) * frac;
     }
-    return { data: out, sampleRate: sampleRate / factor };
+    return { data: out, sampleRate: targetRate };
   }
 
   /** RBJ biquad */
@@ -199,76 +220,985 @@
     return lag + (0.5 * (y0 - y2)) / denom;
   }
 
-  function estimateTempo(flux, frameRate) {
-    const minBpm = 70;
-    const maxBpm = 200;
+  /**
+   * 拍长候选的「正拍 / 半拍」对比度。
+   * 正确的拍长：正拍上是底鼓（重），半拍上是反拍（轻）→ 对比度高。
+   * 拍长取成 1.5 倍或 2 倍时，正拍会混进反拍，对比度掉下来。
+   */
+  /** 取 ±1 帧内的最大值（周期常不是整数帧，直接取整会错过起音） */
+  function sampleMax(flux, idx) {
+    let m = 0;
+    for (let d = -1; d <= 1; d++) {
+      const j = idx + d;
+      if (j >= 0 && j < flux.length && flux[j] > m) m = flux[j];
+    }
+    return m;
+  }
+
+  function beatContrast(flux, period) {
+    const step = Math.max(0.5, period / 32);
+    let bestPhase = 0;
+    let bestOn = -1;
+    for (let ph = 0; ph < period; ph += step) {
+      let sum = 0;
+      let n = 0;
+      for (let k = 0; ; k++) {
+        const i = Math.round(ph + k * period);
+        if (i >= flux.length) break;
+        sum += flux[i];
+        n++;
+      }
+      const avg = n ? sum / n : 0;
+      if (avg > bestOn) { bestOn = avg; bestPhase = ph; }
+    }
+
+    // 取 ±1 帧的最大值：周期常常不是整数帧，四舍五入会「正好错过」起音，
+    // 让错误的周期反而拿到满对比度（这就是之前 150 被估成 100 的原因）。
+    const at = function (idx) { return sampleMax(flux, idx); };
+
+    let onSum = 0, offSum = 0, nOn = 0, nOff = 0;
+    for (let k = 0; ; k++) {
+      const iOn = Math.round(bestPhase + k * period);
+      if (iOn >= flux.length) break;
+      onSum += at(iOn);
+      nOn++;
+      const iOff = Math.round(bestPhase + (k + 0.5) * period);
+      if (iOff < flux.length) { offSum += at(iOff); nOff++; }
+    }
+    const on = onSum / Math.max(1, nOn);
+    const off = offSum / Math.max(1, nOff);
+    return {
+      phase: bestPhase,
+      contrast: (on - off) / Math.max(1e-6, on + off),
+      onAvg: on,
+    };
+  }
+
+  /**
+   * 网格对齐度：这个周期下，多少比例的起音能量落在 16 分网格线上。
+   * 正确的节拍会把起音对齐得很好；差半拍或倍速的候选对不上。
+   */
+  function gridFit(flux, period, phase, frameRate, onsetList) {
+    const step = period / 4;
+    if (step < 2) return 0;
+    // 固定 18ms 容差（而不是按格长缩放），再除以随机命中基线 —— 否则格子越细分数越高
+    const tol = Math.max(0.5, (18 / 1000) * frameRate);
+    let on = 0, off = 0;
+    for (let i = 0; i < flux.length; i++) {
+      const v = flux[i];
+      if (v <= 1e-6) continue;
+      const rel = (i - phase) / step;
+      const d = Math.abs(rel - Math.round(rel)) * step;
+      if (d <= tol) on += v; else off += v;
+    }
+    const sum = on + off;
+    if (sum <= 1e-6) return 0;
+    const chance = Math.min(0.95, (2 * tol) / step);
+    const fitFlux = (on / sum) / Math.max(0.08, chance);
+    // 有起音列表时优先用起音算：起音对网格的响应比频谱能量锐利得多
+    if (onsetList && onsetList.length > 20) {
+      const periodMs = period * 1000 / frameRate;
+      const phaseMs = phase * 1000 / frameRate;
+      const stepMs = periodMs / 4;
+      if (stepMs > 4) {
+        const tolMs = 18;
+        let hit = 0;
+        for (let i = 0; i < onsetList.length; i++) {
+          const rel = (onsetList[i].time - phaseMs) / stepMs;
+          const d = Math.abs(rel - Math.round(rel)) * stepMs;
+          if (d <= tolMs) hit++;
+        }
+        const chanceMs = Math.min(0.95, (2 * tolMs) / stepMs);
+        return (hit / onsetList.length) / Math.max(0.08, chanceMs);
+      }
+    }
+    return fitFlux;
+  }
+
+  /**
+   * 用「起音对 16 分网格的对齐度」精调周期与相位。
+   * 对齐度要除以随机基线，否则格子越细分数越高（会偏向快歌）。
+   */
+  function refinePeriodByOnsets(onsets, periodMs, frameRate) {
+    if (!onsets || onsets.length < 30) return null;
+    let best = null;
+    for (let k = -0.08; k <= 0.0801; k += 0.004) {
+      const p = periodMs * (1 + k);
+      const step = p / 4;
+      if (step < 20) continue;
+      const phaseN = 12;
+      for (let pi = 0; pi < phaseN; pi++) {
+        const ph = (step * pi) / phaseN;
+        let hit = 0;
+        for (let i = 0; i < onsets.length; i++) {
+          const rel = (onsets[i].time - ph) / step;
+          const d = Math.abs(rel - Math.round(rel)) * step;
+          if (d <= 15) hit++;
+        }
+        const chance = Math.min(0.95, 30 / step);
+        const gain = (hit / onsets.length) / Math.max(0.08, chance);
+        if (!best || gain > best.gain) best = { gain: gain, periodMs: p, phaseMs: ph };
+      }
+    }
+    return best;
+  }
+
+
+  /* ------------------------------------------------------------------ *
+   * BPM 候选选择器
+   *
+   * 实测：真 BPM 有 88% 的概率已经出现在候选里，但按 score 选只有 50% 选对。
+   * 关键判别特征是「分段对齐稳定性」——正确的周期在全曲都不会漂移，
+   * 错误的周期会越走越偏。
+   * ------------------------------------------------------------------ */
+  var BPM_SEL = {"w": [-2.330107790961026, 1.0370431614166655, -0.8437217494204038, -0.6101965039041752, -0.8776347222478182, 0.076392724116899, -0.5179061065937395, 2.212902717293538, 2.2129027172935394, 0.0, -2.358328758428658, 1.5765652399359988], "mu": [0.02132448672537473, 0.032890456549865714, 0.2095899241126505, 0.1969582227084953, 0.9398332743735761, 0.34349091900135015, -0.2554672128055472, 0.017551281600869106, 1.0, 0.39009866672516386, 0.43347687153384745], "sd": [0.03296015397681084, 0.04969151283002497, 0.07621062274220737, 0.07244365735953584, 0.045771369840465904, 0.12901278919240355, 0.5536317593286519, 0.5536317593286519, 1.0, 0.16022712399611394, 0.16280236013136734]};
+
+  function beatGridFeatures(onsets, bpm, tolMs) {
+    const beatMs = 60000 / bpm;
+    let bestPh = 0, bestCov = -1, bestHalf = 0;
+    for (let k = 0; k < 24; k++) {
+      const ph = (beatMs * k) / 24;
+      let onBeat = 0, onHalf = 0;
+      for (let i = 0; i < onsets.length; i++) {
+        const rel = (onsets[i].time - ph) / beatMs;
+        const frac = rel - Math.floor(rel);
+        const dB = Math.min(frac, 1 - frac) * beatMs;
+        if (dB <= tolMs) onBeat++;
+        const dH = Math.abs(frac - 0.5) * beatMs;
+        if (dH <= tolMs) onHalf++;
+      }
+      const cov = onBeat / onsets.length;
+      if (cov > bestCov) { bestCov = cov; bestPh = ph; bestHalf = onHalf / onsets.length; }
+    }
+    const step = beatMs / 4;
+    let gridHit = 0;
+    const segN = 8;
+    const t0 = onsets.length ? onsets[0].time : 0;
+    const t1 = onsets.length ? onsets[onsets.length - 1].time : 1;
+    const segHit = new Array(segN).fill(0);
+    const segTot = new Array(segN).fill(0);
+    for (let i = 0; i < onsets.length; i++) {
+      const g = (onsets[i].time - bestPh) / step;
+      if (Math.abs(g - Math.round(g)) * step <= 20) gridHit++;
+      const seg = Math.min(segN - 1, Math.floor((onsets[i].time - t0) / Math.max(1, t1 - t0) * segN));
+      segTot[seg]++;
+      if (Math.abs(g - Math.round(g)) * step <= 25) segHit[seg]++;
+    }
+    const rates = [];
+    for (let s = 0; s < segN; s++) if (segTot[s] > 5) rates.push(segHit[s] / segTot[s]);
+    rates.sort(function (a, b) { return a - b; });
+    return {
+      cov: bestCov,
+      half: bestHalf,
+      halfRatio: bestHalf / Math.max(1e-6, bestCov),
+      grid: gridHit / Math.max(1, onsets.length),
+      segMin: rates.length ? rates[0] : 0,
+      segMed: rates.length ? rates[Math.floor(rates.length / 2)] : 0,
+      phaseMs: bestPh,
+    };
+  }
+
+  function scoreCandidateRow(row, onsets) {
+    const m = beatGridFeatures(onsets, row.bpm, 45);
+    const f = [row.score, row.contrast, m.cov, m.half, m.halfRatio, m.grid,
+               Math.log2(row.bpm / 145), Math.log2(row.bpm / 120), 1, m.segMin, m.segMed];
+    let z = BPM_SEL.w[0];
+    for (let i = 0; i < f.length; i++) {
+      z += BPM_SEL.w[i + 1] * ((f[i] - BPM_SEL.mu[i]) / BPM_SEL.sd[i]);
+    }
+    row.sel = z;
+    row.phaseMs = m.phaseMs;
+    return z;
+  }
+  /** 给定周期和相位，返回起音落在 16 分网格上的平均质量 + 分段质量 */
+  function gridQuality(onsets, bpm, phaseMs, tolMs) {
+    const step = (60000 / bpm) / 4;
+    let sum = 0;
+    for (let i = 0; i < onsets.length; i++) {
+      const g = (onsets[i].time - phaseMs) / step;
+      const d = Math.abs(g - Math.round(g)) * step;
+      if (d <= tolMs) sum += 1 - d / tolMs;
+    }
+    return sum / Math.max(1, onsets.length);
+  }
+
+  /** 最优相位 */
+  function bestPhaseFor(onsets, bpm, tolMs) {
+    const step = (60000 / bpm) / 4;
+    let bestPh = 0, bestQ = -1;
+    for (let k = 0; k < 32; k++) {
+      const ph = (step * k) / 32;
+      const q = gridQuality(onsets, bpm, ph, tolMs);
+      if (q > bestQ) { bestQ = q; bestPh = ph; }
+    }
+    return { phase: bestPh, q: bestQ };
+  }
+
+  /**
+   * 在 bpm0 附近细搜周期 + 相位，再吸附到有理数（整数/半/四分之一）。
+   * 人写谱的 BPM 几乎都是这些值；精确周期在全曲的残差显著更低。
+   */
+  function fitTempoGrid(onsets, bpm0, tolMs, rangeFrac) {
+    if (!onsets || onsets.length < 40) return null;
+    const tol = tolMs || 28;
+    let best = null;
+    for (let k = -30; k <= 30; k++) {
+      const bpm = bpm0 * (1 + k * 0.0005);
+      const bp = bestPhaseFor(onsets, bpm, tol);
+      if (!best || bp.q > best.q) best = { bpm: bpm, phaseMs: bp.phase, q: bp.q, snapped: false };
+    }
+    if (!best) return null;
+    const cands = [];
+    for (const div of [1, 2, 4]) {
+      const v = Math.round(best.bpm * div) / div;
+      if (v > 30 && v < 400) cands.push(v);
+    }
+    for (const v of cands) {
+      const bp = bestPhaseFor(onsets, v, tol);
+      if (bp.q >= best.q * 0.985) {
+        return { bpm: v, phaseMs: bp.phase, q: bp.q, snapped: true };
+      }
+    }
+    return best;
+  }
+
+
+  function estimateTempo(flux, frameRate, onsetList) {
+    const minBpm = 60;
+    const maxBpm = 240;
     const minLag = Math.max(2, Math.round((60 * frameRate) / maxBpm));
     const maxLag = Math.min(flux.length - 1, Math.round((60 * frameRate) / minBpm));
     if (maxLag <= minLag) return { bpm: 120, periodFrames: (60 * frameRate) / 120, phase: 0 };
 
     const scores = autocorrelation(flux, minLag, maxLag);
 
-    // 速度先验：4/4 里底鼓和军鼓交替，两拍周期的自相关天然比一拍强，
-    // 光看峰值会稳定地估成半速。用一个以 145 BPM 为中心的先验压一下，
-    // 宁可估快（网格更细）也不要估慢（整张谱子变粗）。
+    // 速度先验：放宽到 sigma 0.8，中心还是 145（硬核/电子大多落在 120~200）
     const prior = function (bpm) {
-      const x = Math.log2(bpm / 145) / 0.5;
+      const x = Math.log2(bpm / 145) / 0.8;
       return Math.exp(-0.5 * x * x);
     };
 
+    // ① 自相关的前几个峰当种子
+    const peaks = [];
+    for (let lag = minLag + 1; lag < maxLag; lag++) {
+      if (scores[lag] > scores[lag - 1] && scores[lag] >= scores[lag + 1]) peaks.push(lag);
+    }
+    peaks.sort(function (a, b) { return scores[b] - scores[a]; });
+    const seeds = peaks.slice(0, 6);
+    if (!seeds.length) seeds.push(minLag);
+
+    // ② 每个种子扩展出倍速候选（三连音比例会污染结果，已移除）
+    // 只保留八度/倍速关系。三连音比例（2/3、3/2…）在实测中大量赢过真值：
+    // 188.5→138.1(×3/4)、215→143.8(×2/3)、128→191.4(×3/2) 都是这类误判
+    const ratios = [1, 0.5, 2];
+    const cands = {};
+    for (let s = 0; s < seeds.length; s++) {
+      for (let r = 0; r < ratios.length; r++) {
+        const lag = Math.round(seeds[s] * ratios[r]);
+        if (lag < minLag || lag > maxLag) continue;
+        const bpm = (60 * frameRate) / lag;
+        if (bpm < minBpm || bpm > maxBpm) continue;
+        cands[lag] = true;
+      }
+    }
+
+    // ③ 每个候选算「正拍/半拍对比度 × 先验」，取最高
     let bestLag = minLag;
-    let bestScore = -1;
-    for (let lag = minLag; lag <= maxLag; lag++) {
-      const weighted = scores[lag] * prior((60 * frameRate) / lag);
-      if (weighted > bestScore) {
-        bestScore = weighted;
-        bestLag = lag;
-      }
-    }
-
-    // 半速 / 双速的竞争。
-    // 关键：半速的周期一定也能对上所有正拍，所以自相关天然偏向「慢」。
-    // 策略是「只要快的那个不明显更差，就取快的」——人耳也是这么听的。
-    const candidates = [bestLag];
-    if (bestLag * 2 <= maxLag) candidates.push(bestLag * 2);
-    if (bestLag / 2 >= minLag) candidates.push(Math.round(bestLag / 2));
-    candidates.sort(function (a, b) { return a - b; }); // lag 小的 = BPM 高的
-
-    let chosen = bestLag;
-    for (let i = 0; i < candidates.length; i++) {
-      const lag = candidates[i];
-      const w = (scores[lag] || 0) * prior((60 * frameRate) / lag);
-      if (w >= bestScore * 0.85) {
-        chosen = lag;
-        break;
-      }
-    }
-
-    const refined = parabolicPeak(scores, chosen);
-    const periodFrames = refined;
-
-    // 节拍相位：用梳状打分
+    let bestScore = -1e9;
     let bestPhase = 0;
-    let bestPhaseScore = -1;
-    const step = Math.max(0.5, periodFrames / 32);
-    for (let phase = 0; phase < periodFrames; phase += step) {
-      let s = 0;
-      for (let k = 0; ; k++) {
-        const idx = Math.round(phase + k * periodFrames);
-        if (idx >= flux.length) break;
-        s += flux[idx];
+    const keys = Object.keys(cands);
+    const rows = [];
+    let maxOn = 1e-6;
+    for (let i = 0; i < keys.length; i++) {
+      const lag = Number(keys[i]);
+      const bc = beatContrast(flux, lag);
+      const bpm = (60 * frameRate) / lag;
+      if (bc.onAvg > maxOn) maxOn = bc.onAvg;
+      rows.push({ lag: lag, bpm: bpm, contrast: bc.contrast, onAvg: bc.onAvg, phase: bc.phase, score: 0 });
+    }
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      // 正拍要够强（能量项）+ 正拍比半拍明显（对比度项）× 速度先验
+      const energy = Math.min(1, r.onAvg / maxOn);
+      // 低于 80 BPM 的候选要打折：三拍子/一小节一次的周期很容易靠「正拍全中」赢，
+      // 但那不是人跳舞的速度
+      const slowFloor = r.bpm < 80 ? Math.max(0.12, (r.bpm - 45) / 35) : 1;
+      const score = r.contrast * (0.35 + 0.65 * energy) * prior(r.bpm) * slowFloor;
+      r.score = score;
+      if (score > bestScore) {
+        bestScore = score;
+        bestLag = r.lag;
+        bestPhase = r.phase;
       }
-      if (s > bestPhaseScore) {
-        bestPhaseScore = s;
-        bestPhase = phase;
+    }
+
+    // 用选择器重选（候选里含倍速，选择器负责挑对的那个）
+    let selPeriod = null, selPhase = null;
+    if (onsetList && onsetList.length > 30) {
+      let selBest = null, selBestV = -1e9;
+      for (let i = 0; i < rows.length; i++) {
+        const v = scoreCandidateRow(rows[i], onsetList);
+        if (v > selBestV) { selBestV = v; selBest = rows[i]; }
+      }
+      if (selBest) {
+        selPeriod = parabolicPeak(scores, selBest.lag) || selBest.lag;
+        selPhase = (selBest.phaseMs * frameRate) / 1000;
+      }
+    }
+
+    let periodFrames = selPeriod != null ? selPeriod : (parabolicPeak(scores, bestLag) || bestLag);
+    let bc2 = selPhase != null ? { phase: selPhase } : beatContrast(flux, periodFrames);
+
+    // 半速陷阱：4/4 里底鼓在 1、3 拍，军鼓在 2、4 拍，
+    // 自相关会稳定地偏爱「两拍」的周期。判据是——
+    // 如果正拍之间「那一半」也有很强的起音，真实拍长就是它的一半。
+    (function tryDouble() {
+      if (periodFrames < 4) return;
+      let onSum = 0, midSum = 0, n = 0;
+      for (let k = 0; ; k++) {
+        const iOn = Math.round(bc2.phase + k * periodFrames);
+        if (iOn >= flux.length) break;
+        onSum += sampleMax(flux, iOn);
+        const iMid = Math.round(bc2.phase + (k + 0.5) * periodFrames);
+        if (iMid < flux.length) midSum += sampleMax(flux, iMid);
+        n++;
+      }
+      if (!n) return;
+      const on = onSum / n;
+      const mid = midSum / n;
+      if (on <= 1e-6) return;
+      const half = periodFrames / 2;
+      const halfBpm = (60 * frameRate) / half;
+      if (mid / on < 0.62) return;                  // 中间是空的，说明半速才是对的
+      if (halfBpm > maxBpm) return;                 // 加倍后超出范围
+      if (prior(halfBpm) < 0.45) return;            // 先验太不认
+      periodFrames = half;
+      bc2 = beatContrast(flux, periodFrames);
+    })();
+
+    rows.sort(function (a, b) { return b.score - a.score; });
+    // 精细拟合 + 吸附到有理数（120.2 → 120.0），治「后半段漂移」
+    let outBpm = (60 * frameRate) / periodFrames;
+    let outPhase = bc2.phase;
+    if (onsetList && onsetList.length > 40) {
+      const fit = fitTempoGrid(onsetList, outBpm, 28);
+      if (fit && fit.q >= 0.15) {
+        outBpm = fit.bpm;
+        outPhase = (fit.phaseMs * frameRate) / 1000;
+        periodFrames = (60 * frameRate) / outBpm;
       }
     }
 
     return {
-      bpm: (60 * frameRate) / periodFrames,
+      bpm: outBpm,
       periodFrames: periodFrames,
-      phase: bestPhase,
+      phase: outPhase,
+      candidates: rows.slice(0, 12),
     };
+  }
+
+  /* ================================================================== *
+   * 生成管线 V2
+   *
+   * 老管线的毛病：选点 → 和弦 → 间隔过滤 → 轨道分配，每一步都可能悄悄丢音，
+   * 最后在某些段落留下 10 秒空洞。V2 把顺序改成：
+   *   1) 选点（模型或规则）
+   *   2) 分配轨道——**保证每个点都有音符，一个都不丢**
+   *   3) 装饰（和弦 / 长条）——只在「不冲突」时加
+   *   4) 兜底——每 4 小节检查密度，不够就补
+   * ================================================================== */
+
+  /** 选点：按难度网格 + 模型概率，全局取前 N，再给稀段落补保底 */
+
+  /**
+   * 分配轨道：一个点都不丢，但必须守住「同列最小间隔」。
+   * 长条会占住整段，后续不能在同列插音。
+   */
+  // 连续音的音型池。之前只会「相邻 +1」，所以谱面到处是楼梯。
+  const MOTIFS_EASY = ['up', 'down', 'jump', 'up', 'down', 'jump'];
+  const MOTIFS_HARD = ['up', 'down', 'jump', 'trill', 'up', 'down', 'trill'];
+
+
+
+  /** 装饰：和弦与长条。加之前必须确认不冲突，冲突就不加（宁可没有） */
+
+  /**
+   * 同列间隔修正：和弦的镜像音是在轨道分配之后加的，会绕过间隔检查，
+   * 造成同一列 70~100ms 内连响（手按不过来）。这里做一次后处理：
+   * 谁撞了就换到空闲的列，换不动就删掉（和弦少一个音比按不过来好）。
+   */
+
+  /** 同一列连续 3 个以上音（间隔很近）会把第 3 个起搬走；搬不动就删 */
+
+
+  /* ================================================================== *
+   * 实验版生成器：纯序列模型，无任何规则
+   *
+   * 不做段落密度控制、不做同列间隔、不做最长空档、不做和弦规则——
+   * 每个 16 分格放不放音符、放哪几列，全部由网络输出决定。
+   * ================================================================== */
+
+
+  /* ================================================================== *
+   * 间隔模型生成器
+   *
+   * 每一步：看「当前格 + 往后 16 格的起音强度 + 前 4 个事件」，
+   *        预测「下一个音在第几个 16 分格」。
+   *
+   * 关键：间隔是整数个 16 分格 → 音符永远在拍点上；
+   *       输入含往后的起音强度 → 它是在「看着谱面选址」，不是数拍子。
+   * ================================================================== */
+
+
+  /* ================================================================== *
+   * 检索式生成器
+   *
+   * ① 每小节在「人排片段库」里检索起音形状最像的若干片段
+   * ② 只迁移「哪些起音上放音符」这个选择模式：
+   *    用 DTW 把源小节的起音位置对齐到目标小节的起音位置，
+   *    再把音符按映射放过去 —— **不照搬源小节的时刻**
+   * ③ 用学到的衔接偏好重排，挑总分最高的
+   * ================================================================== */
+  let PHRASES = null;
+
+  function loadPhrases() {
+    if (PHRASES) return PHRASES;
+    var M = (typeof window !== 'undefined') && window.M4K;
+    if (!M || !M.PHRASE_B64) return null;
+    var b64 = M.PHRASE_B64;
+    var bin;
+    if (typeof atob === 'function') {
+      var s = atob(b64);
+      bin = new Uint8Array(s.length);
+      for (var i = 0; i < s.length; i++) bin[i] = s.charCodeAt(i);
+    } else {
+      bin = new Uint8Array(Buffer.from(b64, 'base64'));
+    }
+    var dv = new DataView(bin.buffer, bin.byteOffset, bin.byteLength);
+    if (bin[0] !== 80 || bin[1] !== 72 || bin[2] !== 82 || bin[3] !== 49) return null;
+    var n = dv.getUint32(4, true);
+    var REC = 50;                     // 16 + 1 + 1 + 32
+    var out = [];
+    for (var r = 0; r < n; r++) {
+      var off = 8 + r * REC;
+      var prof = new Float32Array(16);
+      for (var j = 0; j < 16; j++) prof[j] = bin[off + j] / 255;
+      var tier = bin[off + 16];
+      var cnt = bin[off + 17];
+      var notes = [];
+      for (var k = 0; k < cnt; k++) {
+        var v = dv.getUint16(off + 18 + k * 2, true);
+        if (v === 0xFFFF) continue;
+        notes.push([v >> 2, v & 3]);
+      }
+      out.push({ prof: prof, tier: tier, notes: notes });
+    }
+    PHRASES = out;
+    return PHRASES;
+  }
+
+  /** DTW：把 src(16) 的每个位置映射到 dst(16) */
+  function dtwMap(src, dst) {
+    var N = 16, INF = 1e9;
+    var D = new Float32Array((N + 1) * (N + 1));
+    for (var i = 0; i <= N; i++) for (var j = 0; j <= N; j++) D[i * (N + 1) + j] = INF;
+    D[0] = 0;
+    for (var a = 1; a <= N; a++) {
+      for (var b = 1; b <= N; b++) {
+        var c = Math.abs(src[a - 1] - dst[b - 1]);
+        var m = Math.min(D[(a - 1) * (N + 1) + (b - 1)], D[(a - 1) * (N + 1) + b], D[a * (N + 1) + (b - 1)]);
+        D[a * (N + 1) + b] = c + m;
+      }
+    }
+    var mp = {};
+    var i2 = N, j2 = N;
+    while (i2 > 0 && j2 > 0) {
+      if (mp[i2 - 1] === undefined) mp[i2 - 1] = j2 - 1;
+      var c2 = Math.abs(src[i2 - 1] - dst[j2 - 1]);
+      var cur = D[i2 * (N + 1) + j2];
+      if (Math.abs(cur - c2 - D[(i2 - 1) * (N + 1) + (j2 - 1)]) < 1e-7) { i2--; j2--; }
+      else if (Math.abs(cur - c2 - D[(i2 - 1) * (N + 1) + j2]) < 1e-7) { i2--; }
+      else { j2--; }
+    }
+    return mp;
+  }
+
+
+
+  /* ================================================================== *
+   * 按拍生成器
+   *
+   * 人排 87% 的拍子有音符（normal），而逐格生成只有 75%——因为它按「起音」思考。
+   * 这里按「拍」生成：先判断这一拍要不要有音，再选这一拍的细分掩码。
+   * ================================================================== */
+  var BEAT = null;
+
+  function loadBeatModel() {
+    if (BEAT) return BEAT;
+    var M = (typeof window !== 'undefined') && window.M4K;
+    if (!M || !M.BEAT_WEIGHTS) return null;
+    var d = M.BEAT_WEIGHTS;
+    function f32(s) {
+      if (typeof atob === 'function') {
+        var bin = atob(s);
+        var out = new Float32Array(bin.length / 4);
+        for (var i = 0; i < out.length; i++) {
+          var v = (bin.charCodeAt(i*4) | (bin.charCodeAt(i*4+1) << 8) | (bin.charCodeAt(i*4+2) << 16) | (bin.charCodeAt(i*4+3) << 24)) >>> 0;
+          out[i] = new Float32Array(new Uint32Array([v]).buffer)[0];
+        }
+        return out;
+      }
+      var buf = Buffer.from(s, 'base64');
+      return new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
+    }
+    BEAT = { inDim: d.inDim, hid: d.hid };
+    for (var k in d) {
+      if (k === 'inDim' || k === 'hid') continue;
+      BEAT[k] = f32(d[k]);
+    }
+    return BEAT;
+  }
+
+  function lin(x, w, b, outN, inN) {
+    var o = new Float32Array(outN);
+    for (var i = 0; i < outN; i++) {
+      var s = b[i], base = i * inN;
+      for (var j = 0; j < inN; j++) s += w[base + j] * x[j];
+      o[i] = s;
+    }
+    return o;
+  }
+
+  function generateBeat(analysis, opts) {
+    if (!analysis._mel && analysis._pcm) {
+      analysis._mel = computeMel(analysis._pcm, analysis._pcmSr || 22050);
+    }
+    var mel = analysis._mel;
+    if (!mel) return null;
+
+    var beat = analysis.beatMs;
+    var offset = analysis.offset;
+    var step = beat / 4;
+    var nSlot = Math.floor((analysis.duration - offset) / step);
+    var nBeat = Math.floor(nSlot / 4);
+    if (nBeat < 32) return null;
+
+    // 真实拍点（本地节拍服务返回）；没有就用均匀网格
+    var beatTimes = (analysis.beatsMs && analysis.beatsMs.length > 8) ? analysis.beatsMs : null;
+    if (beatTimes) nBeat = Math.min(nBeat, beatTimes.length - 1);
+    function beatTimeOf(b) {
+      if (!beatTimes) return offset + b * beat;
+      return beatTimes[Math.max(0, Math.min(beatTimes.length - 1, b))];
+    }
+
+    var srcAll = (analysis.onsets || []).filter(function (o) { return o.strength > 0.14; });
+    var energy = analysis.energy || [];
+    var tierId = opts.difficulty === 'easy' ? 0 : (opts.difficulty === 'hard' ? 2 : 1);
+
+    // ---- 每拍能量 + 长窗口平滑（人排密度是「一段一段」的）----
+    var beatEnergy = new Array(nBeat).fill(0);
+    var beatOf = function (tms) {
+      var lo = 0, hi = nBeat - 1, best = 0;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (beatTimeOf(mid) <= tms) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+      }
+      return best;
+    };
+    for (var ei = 0; ei < srcAll.length; ei++) {
+      var oo = srcAll[ei];
+      if (oo.time < offset) continue;
+      var bi = beatOf(oo.time);
+      if (bi < 0 || bi >= nBeat) continue;
+      var wgt = oo.band === 'low' ? 1.25 : (oo.band === 'mid' ? 1.1 : 0.75);
+      beatEnergy[bi] += oo.strength * wgt;
+    }
+    var R = 6;
+    var smoothed = new Array(nBeat).fill(0);
+    for (var sb = 0; sb < nBeat; sb++) {
+      var acc = 0, cnt = 0;
+      for (var off2 = -R; off2 <= R; off2++) {
+        var idx2 = sb + off2;
+        if (idx2 < 0 || idx2 >= nBeat) continue;
+        var w2 = 1 - Math.abs(off2) / (R + 1);
+        acc += beatEnergy[idx2] * w2;
+        cnt += w2;
+      }
+      smoothed[sb] = cnt > 0 ? acc / cnt : 0;
+    }
+    var sortedE = smoothed.slice().sort(function (x, y) { return x - y; });
+    var q10 = sortedE[Math.floor(nBeat * 0.10)] || 0;
+    var q40 = sortedE[Math.floor(nBeat * 0.40)] || 0;
+    var q70 = sortedE[Math.floor(nBeat * 0.70)] || 0;
+    var q97 = sortedE[Math.floor(nBeat * 0.97)] || 0;
+
+    // ---- 起音时间表（吸附用）----
+    var onsetTimes = srcAll.map(function (o) { return o.time; }).sort(function (x, y) { return x - y; });
+    function snapNear(tms, tol) {
+      if (!onsetTimes.length) return null;
+      var lo = 0, hi = onsetTimes.length - 1, best = -1;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (onsetTimes[mid] <= tms) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+      }
+      var pickT = -1, pd = tol + 1;
+      for (var k = Math.max(0, best - 1); k <= Math.min(onsetTimes.length - 1, best + 2); k++) {
+        var d = Math.abs(onsetTimes[k] - tms);
+        if (d < pd) { pd = d; pickT = onsetTimes[k]; }
+      }
+      return pd <= tol ? Math.round(pickT) : null;
+    }
+
+    // ---- 铺格：先按「每秒音符数」定密度，再落点 ----
+    var tierRate = tierId === 0 ? 3.0 : (tierId === 2 ? 8.5 : 5.0);
+    var wantPerBeat = tierRate * (beat / 1000);
+    var pickedRaw = [];
+    var levelAcc = 0;
+    var prevLevel = 1;
+    for (var pb = 0; pb < nBeat; pb++) {
+      var e = smoothed[pb];
+      var level = 0;
+      if (e >= q10) {
+        // 活跃的拍先保证 1 个音（四分填充率），多的用累积器加
+        var extra = wantPerBeat - 1;
+        levelAcc += extra;
+        level = 1;
+        if (levelAcc >= 1.4) { level = 3; levelAcc -= 2.4; }
+        else if (levelAcc >= 0.4) { level = 2; levelAcc -= 1.0; }
+        // 安静段落降级（保留起伏），但至少保留 1 个音
+        if (e < q40 && level > 1) { levelAcc += (level - 1); level = 1; }
+        // 限制跳变：相邻拍最多升一级，避免高潮段突然暴增
+        if (level > prevLevel + 1) { levelAcc += (level - (prevLevel + 1)); level = prevLevel + 1; }
+        if (tierId === 0 && level > 2) { levelAcc += (level - 2); level = 2; }
+        prevLevel = level;
+      }
+      var t0d = beatTimeOf(pb), t1d = beatTimeOf(pb + 1);
+      if (t1d <= t0d) continue;
+      var nSub = level === 1 ? 1 : (level === 2 ? 2 : 4);
+      for (var sub = 0; sub < nSub; sub++) {
+        var tt = t0d + (t1d - t0d) * (sub / nSub);
+        // easy 收紧吸附：避免把正拍位置拉到反拍的起音上
+            var sn = snapNear(tt, tierId === 0 ? 40 : 55);
+            if (sn !== null) pickedRaw.push(sn);
+            else if (tierId === 0 && e >= q40) pickedRaw.push(Math.round(tt));   // easy：只在高潮段补「拍上有音」
+            else if (e >= q97) pickedRaw.push(Math.round(tt));
+      }
+    }
+
+    // ---- 收尾：合并近点（和弦同时）→ 吸附 1/12 拍 → 去重 ----
+    pickedRaw.sort(function (x, y) { return x - y; });
+    var merged = [];
+    for (var mi = 0; mi < pickedRaw.length; mi++) {
+      if (merged.length && pickedRaw[mi] - merged[merged.length - 1] <= 25) continue;
+      merged.push(pickedRaw[mi]);
+    }
+    var fine = beat / 12;
+    for (var fi = 0; fi < merged.length; fi++) {
+      var g2 = Math.round((merged[fi] - offset) / fine);
+      var sn2 = offset + g2 * fine;
+      if (Math.abs(sn2 - merged[fi]) <= 12) merged[fi] = Math.round(sn2);
+    }
+    var pickedTimes = [];
+    for (var di = 0; di < merged.length; di++) {
+      if (pickedTimes.length && Math.abs(merged[di] - pickedTimes[pickedTimes.length - 1]) <= 25) continue;
+      pickedTimes.push(merged[di]);
+    }
+
+    // ---- 列：阶段 B（GRU，带历史）+ 和弦预算 ----
+    var notes = [];
+    var SEQm = (typeof window !== 'undefined') && window.M4K && window.M4K.SEQ;
+    if (SEQm && SEQm.stage2Columns) {
+      var sets = SEQm.stage2Columns(mel, pickedTimes, mel.rate, beat, 8);
+      var cf = tierId === 0 ? 1.05 : (tierId === 2 ? 1.25 : 1.15);
+      var budget = Math.round(pickedTimes.length * cf);
+      var all = [];
+      for (var pi2 = 0; pi2 < pickedTimes.length; pi2++) {
+        var pr = sets && sets[pi2] ? sets[pi2] : [1, 0, 0, 0];
+        for (var c = 0; c < 4; c++) all.push([pr[c], pi2, c]);
+      }
+      all.sort(function (a, b) { return b[0] - a[0]; });
+      var perT = {}, cnt2 = 0;
+      for (var ai = 0; ai < all.length && cnt2 < budget; ai++) {
+        var ti = all[ai][1];
+        if ((perT[ti] || 0) >= 2) continue;
+        perT[ti] = (perT[ti] || 0) + 1;
+        cnt2++;
+        notes.push({ col: all[ai][2], time: pickedTimes[ti], end: null, isHold: false });
+      }
+    } else {
+      for (var p3 = 0; p3 < pickedTimes.length; p3++) {
+        notes.push({ col: p3 % 4, time: pickedTimes[p3], end: null, isHold: false });
+      }
+    }
+
+    // ---- 键型模式（人排的交错式排键）----
+    (function humanPatterns() {
+      notes.sort(function (a, b) { return a.time - b.time || a.col - b.col; });
+      var PAT = [
+        [0,1,2,3], [3,2,1,0],
+        [0,1,2,3,2,1], [3,2,1,0,1,2],
+        [0,1,3,2], [3,2,0,1],
+        [0,3,1,2], [3,0,2,1],
+        [0,2,1,3], [3,1,2,0],
+        [0,2,3,1], [3,1,0,2],
+        [1,2,3,0], [2,1,0,3]
+      ];
+      var seed = 918273645;
+      function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+      var groups = [];
+      for (var i = 0; i < notes.length; i++) {
+        var last = groups[groups.length - 1];
+        if (last && Math.abs(last[0].time - notes[i].time) < 1) last.push(notes[i]);
+        else groups.push([notes[i]]);
+      }
+      var k = 0;
+      while (k < groups.length) {
+        if (groups[k].length !== 1) { k++; continue; }
+        var e2 = k;
+        while (e2 + 1 < groups.length && groups[e2 + 1].length === 1) e2++;
+        var len = e2 - k + 1;
+        if (len < 4) { k = e2 + 1; continue; }
+        var pat = PAT[Math.floor(rnd() * PAT.length)];
+        var startCol = groups[k][0].col, off = 0, bestD = 9;
+        for (var q = 0; q < pat.length; q++) {
+          var d = Math.abs(pat[q] - startCol);
+          if (d < bestD) { bestD = d; off = q; }
+        }
+        for (var g = 0; g < len; g++) groups[k + g][0].col = pat[(off + g) % pat.length];
+        k = e2 + 1;
+      }
+    })();
+
+    // ---- 乐句重复（复制列序，保留时间与密度）----
+    (function phraseRepeat() {
+      var PHRASE = 8;
+      var nPh = Math.floor(nBeat / PHRASE);
+      if (nPh < 2) return;
+      var vec = [];
+      for (var p = 0; p < nPh; p++) {
+        var v = [];
+        for (var bb = p * PHRASE; bb < (p + 1) * PHRASE && bb < nBeat; bb++) v.push(beatEnergy[bb] || 0);
+        var nrm = Math.sqrt(v.reduce(function (a, x) { return a + x * x; }, 0)) || 1;
+        vec.push(v.map(function (x) { return x / nrm; }));
+      }
+      var byPhrase = [];
+      for (var p2 = 0; p2 < nPh; p2++) byPhrase.push([]);
+      for (var ni = 0; ni < notes.length; ni++) {
+        var ph = Math.floor(beatOf(notes[ni].time) / PHRASE);
+        if (ph >= 0 && ph < nPh) byPhrase[ph].push(notes[ni]);
+      }
+      var seed = 20241111;
+      function rnd2() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+      for (var p3 = 1; p3 < nPh; p3++) {
+        var prev = byPhrase[p3 - 1], cur = byPhrase[p3];
+        if (!prev.length || cur.length < 4) continue;
+        var sim = 0;
+        for (var k2 = 0; k2 < Math.min(vec[p3 - 1].length, vec[p3].length); k2++) sim += vec[p3 - 1][k2] * vec[p3][k2];
+        if (sim < 0.80) continue;
+        var mirror = rnd2() < 0.5;
+        var lim = Math.min(cur.length, prev.length);
+        for (var q2 = 0; q2 < lim; q2++) {
+          cur[q2].col = mirror ? (3 - prev[q2].col) : prev[q2].col;
+        }
+      }
+    })();
+
+    // ---- 同列连打修复（90ms）----
+    (function fixJacks() {
+      notes.sort(function (a, b) { return a.time - b.time || a.col - b.col; });
+      var lastPerCol = [-1e9, -1e9, -1e9, -1e9];
+      for (var qi = 0; qi < notes.length; qi++) {
+        var nt = notes[qi];
+        if (nt.time - lastPerCol[nt.col] < 90) {
+          var cand = -1, bestGap = -1;
+          for (var c2 = 0; c2 < 4; c2++) {
+            if (c2 === nt.col) continue;
+            var gap = nt.time - lastPerCol[c2];
+            if (gap >= 90 && gap > bestGap) { bestGap = gap; cand = c2; }
+          }
+          if (cand >= 0) nt.col = cand;
+          else { notes.splice(qi, 1); qi--; continue; }
+        }
+        lastPerCol[nt.col] = nt.time;
+      }
+    })();
+
+    // ---- 消同列兜底（放在所有列操作之后）----
+    (function noRepeat() {
+      notes.sort(function (a, b) { return a.time - b.time || a.col - b.col; });
+      var groups2 = [];
+      for (var i2 = 0; i2 < notes.length; i2++) {
+        var last = groups2[groups2.length - 1];
+        if (last && Math.abs(last[0].time - notes[i2].time) < 1) last.push(notes[i2]);
+        else groups2.push([notes[i2]]);
+      }
+      var lastByCol = [-1e9, -1e9, -1e9, -1e9];
+      var prevCol = -1, prevT = -1e9;
+      for (var g2 = 0; g2 < groups2.length; g2++) {
+        var grp = groups2[g2];
+        var gT = grp[0].time;
+        if (grp.length === 1) {
+          var n0 = grp[0];
+          if (prevCol >= 0 && n0.col === prevCol) {   // 无条件避开上一个音（人手不打连按）
+            var order2 = [];
+            if (prevCol > 0) order2.push(prevCol - 1);
+            if (prevCol < 3) order2.push(prevCol + 1);
+            order2.push(prevCol === 0 ? 2 : 0, prevCol === 3 ? 1 : 3);
+            var pick = -1, pickScore = -1e18;
+            for (var ci = 0; ci < order2.length; ci++) {
+              var cc = order2[ci];
+              var age = gT - lastByCol[cc];
+              if (age <= 0.15 * beat) continue;
+              var sc = age + (ci < 2 ? 0 : -1e6);
+              if (sc > pickScore) { pickScore = sc; pick = cc; }
+            }
+            if (pick >= 0) n0.col = pick;
+          }
+          lastByCol[n0.col] = gT;
+          prevCol = n0.col;
+          prevT = gT;
+        } else {
+          for (var gi = 0; gi < grp.length; gi++) lastByCol[grp[gi].col] = gT;
+          prevCol = -1;
+          prevT = gT;
+        }
+      }
+    })();
+
+    // ---- 长条（最后做，基于最终位置）----
+    // 小节密度上限：任何一个小节都不该超过目标密度的 1.35 倍
+    (function capPerBar() {
+      var barMs2 = beat * 4;
+      var cap = Math.max(2, Math.round(tierRate * (barMs2 / 1000) * 1.35));
+      var byBar = {};
+      for (var i = 0; i < notes.length; i++) {
+        var b = Math.floor((notes[i].time - offset) / barMs2);
+        (byBar[b] = byBar[b] || []).push(notes[i]);
+      }
+      var keep = [];
+      for (var k in byBar) {
+        var arr = byBar[k];
+        if (arr.length <= cap) { keep = keep.concat(arr); continue; }
+        arr.sort(function (x, y) { return x.time - y.time || x.col - y.col; });
+        var seenT = {}, singles = [];
+        for (var j = 0; j < arr.length; j++) {
+          var key = Math.round(arr[j].time / 8);
+          if (seenT[key]) continue;
+          seenT[key] = true;
+          singles.push(arr[j]);
+        }
+        if (singles.length > cap) singles = singles.slice(0, cap);
+        keep = keep.concat(singles);
+      }
+      notes = keep;
+    })();
+
+    // 列最小间隔：同一列 0.45 拍内不出现两次（含和弦成员）
+    (function columnGap() {
+      globalThis.__cg = (globalThis.__cg || 0) + 1;
+      notes.sort(function (a, b) { return a.time - b.time || a.col - b.col; });
+      var minGap = Math.max(120, beat * 0.6);
+      var lastCol = [-1e9, -1e9, -1e9, -1e9];
+      var prevNoteCol = -1;
+      for (var i = 0; i < notes.length; i++) {
+        var n = notes[i];
+        if (n.time - lastCol[n.col] >= minGap) {
+          lastCol[n.col] = n.time; prevNoteCol = n.col; continue;
+        }
+        var bestC = -1, bestAge = -1;
+        for (var c = 0; c < 4; c++) {
+          if (c === n.col || c === prevNoteCol) continue;   // 也避开上一个音
+          var age = n.time - lastCol[c];
+          if (age > bestAge) { bestAge = age; bestC = c; }
+        }
+        globalThis.__cgMove = (globalThis.__cgMove || 0) + 1;
+        if (bestC >= 0 && bestAge >= minGap) {
+          n.col = bestC; lastCol[bestC] = n.time; prevNoteCol = bestC;
+        }
+        else { notes.splice(i, 1); i--; }
+      }
+    })();
+
+    (function makeHolds() {
+      notes.sort(function (a, b) { return a.time - b.time || a.col - b.col; });
+      var wantHolds = Math.round(notes.length * 0.10);
+      var minGap = (tierId === 2) ? beat * 0.45 : beat * 0.9;
+      var minLen = beat * (tierId === 2 ? 0.3 : 0.45);
+      var seedH = 776655;
+      function rndH() { seedH = (seedH * 1103515245 + 12345) & 0x7fffffff; return seedH / 0x7fffffff; }
+      var cands = [];
+      for (var i3 = 0; i3 < notes.length; i3++) {
+        var nt3 = notes[i3];
+        var nextT = Infinity;
+        for (var j3 = i3 + 1; j3 < notes.length; j3++) {
+          if (notes[j3].col !== nt3.col) continue;
+          if (notes[j3].time > nt3.time + 1) { nextT = notes[j3].time; break; }
+        }
+        if (!isFinite(nextT) || nextT - nt3.time < minGap) continue;
+        var smax = 0;
+        for (var hk = 0; hk < srcAll.length; hk++) {
+          if (srcAll[hk].time >= nt3.time + beat * 2 + 40) break;
+          if (srcAll[hk].time >= nt3.time - 20 && srcAll[hk].strength > smax) smax = srcAll[hk].strength;
+        }
+        cands.push([Math.min(nextT - nt3.time, beat * 3) + smax * 200, i3]);
+      }
+      cands.sort(function (x, y) { return y[0] - x[0]; });
+      var made = 0, holdTimes = [];
+      for (var hc = 0; hc < cands.length && made < wantHolds; hc++) {
+        var idH = cands[hc][1];
+        var ntH = notes[idH];
+        if (ntH.isHold) continue;
+        var next2 = Infinity;
+        for (var j4 = 0; j4 < notes.length; j4++) {
+          if (j4 === idH) continue;
+          var nx = notes[j4];
+          if (nx.col !== ntH.col || nx.time <= ntH.time + 1) continue;
+          next2 = nx.time; break;
+        }
+        var tooClose = false;
+        for (var ht = 0; ht < holdTimes.length; ht++) {
+          if (Math.abs(holdTimes[ht] - ntH.time) < beat * 0.9) { tooClose = true; break; }
+        }
+        if (tooClose) continue;
+        var lenBeats = 0.5 + rndH() * 1.0;
+        var endT = Math.min(ntH.time + beat * lenBeats, next2 - beat * 0.15);
+        if (endT - ntH.time < minLen) continue;
+        holdTimes.push(ntH.time);
+        ntH.isHold = true;
+        ntH.end = Math.round(endT);
+        made++;
+      }
+    })();
+
+    notes.sort(function (a, b) { return a.time - b.time || a.col - b.col; });
+    for (var ni2 = 0; ni2 < notes.length; ni2++) notes[ni2].id = ni2;
+
+    return {
+      keyCount: 4,
+      notes: notes,
+      meta: {
+        title: opts.title || '按拍生成',
+        artist: opts.artist || '',
+        version: 'BEAT',
+        creator: 'Rhythm4K',
+        source: '', tags: '', background: '', video: '', videoStart: 0,
+        events: [], mode: 3,
+      },
+      auto: {
+        bpm: Math.round(analysis.bpm * 10) / 10,
+        offset: Math.round(offset),
+        difficulty: opts.difficulty || 'normal',
+        version: ANALYZER_VERSION,
+      },
+      audioFilename: '',
+      difficulty: { OverallDifficulty: 8, HPDrainRate: 7 },
+    };
+  }
+
+
+  function generate(analysis, options) {
+    const opts = options || {};
+    return generateBeat(analysis, opts);
   }
 
   /* ---------------- 主分析 ---------------- */
@@ -292,6 +1222,7 @@
     const envs = {};
     const bandPeak = {};
     const combined = new Float32Array(Math.floor(x.length / FRAME));
+    const combinedTempo = new Float32Array(Math.floor(x.length / FRAME));
     const onsets = [];
 
     for (let b = 0; b < bands.length; b++) {
@@ -305,6 +1236,13 @@
       const flux = normalize(fluxOf(env));
       fluxes[band.name] = flux;
       for (let i = 0; i < flux.length && i < combined.length; i++) combined[i] += flux[i];
+
+      // 测速用的合成流：低频（底鼓）主导。三个频段等权的话，
+      // 电子乐里密集的踩镲会把节拍彻底淹掉（实测对比度掉到 0.05 以下）。
+      const w = band.name === 'low' ? 1.0 : band.name === 'mid' ? 0.55 : 0.15;
+      for (let i = 0; i < flux.length && i < combinedTempo.length; i++) {
+        combinedTempo[i] += flux[i] * w;
+      }
 
       const peaks = pickPeaks(flux, minGapFrames);
       for (let p = 0; p < peaks.length; p++) {
@@ -320,27 +1258,53 @@
 
     const curve = energyCurve(envs, frameRate);
 
-    const tempo = estimateTempo(normalize(combined), frameRate);
+    const tempo = estimateTempo(normalize(combinedTempo), frameRate, onsets);
+    // 测速候选（排查用）
     const beatMs = 60000 / tempo.bpm;
-    const offsetMs = (tempo.phase / frameRate) * 1000;
+
+    // 相位精修：tempo.phase 只有能量帧的精度（约 5.8ms），
+    // 而吸附容差只有 stepMs 的 25%（190 BPM 时 25ms）。
+    // 相位偏 30ms 就会让整片起音被判成「不在网格上」全部丢掉。
+    // 这里用毫秒级的起音时刻再做一次 ±半拍、1ms 步进的搜索。
+    let offsetMs = (tempo.phase / frameRate) * 1000;
+    (function refinePhase() {
+      const strong = onsets.filter(function (o) { return o.strength >= 0.25; });
+      if (strong.length < 20) return;
+      const base = offsetMs;
+      let best = base;
+      let bestScore = -1;
+      for (let off = base - beatMs / 2; off <= base + beatMs / 2; off += 1) {
+        let s = 0;
+        for (let i = 0; i < strong.length; i++) {
+          const rel = (strong[i].time - off) / beatMs;
+          const d = Math.abs(rel - Math.round(rel)) * beatMs;
+          if (d < 10) s += strong[i].strength * (1 - d / 10);
+        }
+        if (s > bestScore) { bestScore = s; best = off; }
+      }
+      offsetMs = best;
+    })();
 
     // 小节相位：grid 的哪一拍是小节第一拍。
-    // 不找出这个，和弦规则会落在错拍的弱音上（踩镲）而不是下拍（底鼓）。
-    const comb = normalize(combined);
+    // 注意必须用「精修后的 offsetMs」来算——早期用的是 tempo.phase（能量帧精度），
+    // 相位精修之后就差了将近一拍，和弦会整片落到第二拍上。
     let downbeat = 0;
     let bestDown = -1;
     for (let p = 0; p < 4; p++) {
       let s = 0;
-      for (let k = 0; ; k++) {
-        const idx = Math.round(tempo.phase + (k * 4 + p) * tempo.periodFrames);
-        if (idx >= comb.length) break;
-        s += comb[idx];
+      for (let i = 0; i < onsets.length; i++) {
+        const o = onsets[i];
+        const rel = (o.time - offsetMs - p * beatMs) / (beatMs * 4);
+        const d = Math.abs(rel - Math.round(rel)) * beatMs * 4;
+        if (d < 25) s += o.strength * (1 - d / 25);
       }
       if (s > bestDown) { bestDown = s; downbeat = p; }
     }
 
     return {
+      _pcm: samples, _pcmSr: sampleRate,
       bpm: tempo.bpm,
+      tempoCandidates: tempo.candidates || null,
       beatMs: beatMs,
       offset: offsetMs,
       downbeat: downbeat,
@@ -350,6 +1314,11 @@
       bands: fluxes,
       envs: envs,
       energy: curve.curve,
+      bars: analyzeBars({
+        frameRate: frameRate, beatMs: beatMs, offset: offsetMs,
+        duration: (samples.length / sampleRate) * 1000,
+        envs: envs, onsets: onsets,
+      }),
       // 段落起伏够不够明显：不够就别硬套高潮/间奏的密度曲线
       sections: { contrast: curve.contrast, hasSections: curve.contrast >= 0.7 },
 
@@ -376,9 +1345,9 @@
   const DIFFICULTIES = {
     // 简单/普通比初版更密：允许多到 8 分 / 16 分，长条概率也提高
     // maxChord = 同一时刻最多几个键；chordEveryBeats = 每隔几拍才允许和弦
-    easy: { stepsPerBeat: 2, minGapBeats: 0.5, minStrength: 0.32, runGapBeats: 0.58, maxChord: 2, chordOnBeats: [0], chordFactor: 0.5, targetPerBeat: 1.4 },
-    normal: { stepsPerBeat: 4, minGapBeats: 0.24, minStrength: 0.09, runGapBeats: 0.62, maxChord: 2, chordOnBeats: [0], chordFactor: 1.2, targetPerBeat: 2.4 },
-    hard: { stepsPerBeat: 4, minGapBeats: 0.22, minStrength: 0.10, runGapBeats: 0.7, maxChord: 3, chordOnBeats: [0], chordFactor: 1.2, targetPerBeat: 3.4 },
+    easy: { stepsPerBeat: 2, minGapBeats: 0.5, minStrength: 0.32, runGapBeats: 0.58, maxChord: 2, chordOnBeats: [0], chordFactor: 0.7, targetPerBeat: 0.7 },
+    normal: { stepsPerBeat: 4, minGapBeats: 0.24, minStrength: 0.09, runGapBeats: 0.62, maxChord: 2, chordOnBeats: [0, 2], chordFactor: 1.9, targetPerBeat: 1.25 },
+    hard: { stepsPerBeat: 4, minGapBeats: 0.22, minStrength: 0.10, runGapBeats: 0.7, maxChord: 3, chordOnBeats: [0, 1, 2, 3], chordFactor: 2.4, targetPerBeat: 2.0 },
   };
 
   /**
@@ -386,6 +1355,95 @@
    * 用来区分「高潮 / 间奏」：高潮段和声厚、压缩重，能量上升沿反而少，
    * 光靠起音检测会让高潮比间奏还空，所以要按段落强度反过来调密度。
    */
+  /**
+   * 小节级特征 + 重复分组。
+   *
+   * 人排谱的核心习惯：乐句重复的地方，谱面也重复；只有变奏段才改写法。
+   * 要复现这个，先得知道「哪几小节是同一段音乐」。
+   * 做法：每小节取三个频段的平均能量 + 起音密度构成特征向量，
+   * 余弦相似度超过阈值的归到同一个组（组号 = 首次出现的小节）。
+   */
+  function analyzeBars(analysis) {
+    const beatMs = analysis.beatMs;
+    const barMs = beatMs * 4;
+    const offset = analysis.offset;
+    const total = analysis.duration;
+    const count = Math.max(0, Math.floor((total - offset) / barMs));
+    if (count < 4) return null;
+
+    const onsets = analysis.onsets || [];
+    const stepMs = beatMs / 4;
+
+    // 每小节只取「重音」（≥ 本小节最强的 60%），做成 16 位二值掩码。
+    // 用强度值算余弦没用——电子乐里几乎每个十六分都有踩镲，任意两小节的
+    // 余弦都在 0.88 以上，分不出「这段是哪段」。二值掩码 + Jaccard 才行。
+    const masks = [];
+    for (let b = 0; b < count; b++) {
+      const t0 = offset + b * barMs;
+      const t1 = t0 + barMs;
+      let mx = 0;
+      for (let i = 0; i < onsets.length; i++) {
+        const o = onsets[i];
+        if (o.time >= t0 && o.time < t1 && o.strength > mx) mx = o.strength;
+      }
+      const m = new Uint8Array(16);
+      for (let i = 0; i < onsets.length; i++) {
+        const o = onsets[i];
+        if (o.time < t0 || o.time >= t1) continue;
+        if (o.strength < mx * 0.6) continue;
+        let s = Math.round((o.time - t0) / stepMs) % 16;
+        if (s < 0) s += 16;
+        m[s] = 1;
+      }
+      masks.push(m);
+    }
+
+    const jac = function (a, c) {
+      let inter = 0;
+      let uni = 0;
+      for (let i = 0; i < 16; i++) {
+        if (a[i] || c[i]) uni++;
+        if (a[i] && c[i]) inter++;
+      }
+      return uni ? inter / uni : 0;
+    };
+
+    // 找最像自己的另一小节（距离 ≥ 2），要求相似度够高
+    const SIM = 0.65;
+    const groups = new Array(count);
+    for (let b = 0; b < count; b++) groups[b] = b;
+    for (let b = 2; b < count; b++) {
+      let best = -1;
+      let bestScore = SIM;
+      for (let j = Math.max(0, b - 32); j <= b - 2; j++) {
+        const s = jac(masks[b], masks[j]);
+        if (s > bestScore) { bestScore = s; best = j; }
+      }
+      if (best >= 0) groups[b] = groups[best];
+    }
+
+    const distCount = {};
+    for (let b = 0; b < count; b++) {
+      if (groups[b] === b) continue;
+      const d = b - groups[b];
+      if (d > 0 && d <= 32) distCount[d] = (distCount[d] || 0) + 1;
+    }
+    let phraseLen = 0;
+    let bestD = 0;
+    for (const d in distCount) {
+      if (distCount[d] > bestD) { bestD = distCount[d]; phraseLen = Number(d); }
+    }
+    let repeated = 0;
+    for (let b = 0; b < count; b++) if (groups[b] !== b) repeated++;
+
+    return {
+      count: count,
+      groups: groups,
+      phraseLength: phraseLen,
+      repeated: repeated,
+      masks: masks,
+    };
+  }
   function energyCurve(envs, frameRate) {
     const n = envs.low ? envs.low.length : 0;
     if (!n) return new Float32Array(0);
@@ -492,7 +1550,7 @@
     const e = analysis.energy;
     if (!e || !e.length) return 0.5;
     const fr = analysis.frameRate || 172;
-    const half = Math.round(fr * 2);
+    const half = Math.round(fr * 2.5);
     const c = Math.max(0, Math.min(e.length - 1, Math.round((timeMs / 1000) * fr)));
     let sum = 0;
     let n = 0;
@@ -509,437 +1567,348 @@
     return null;
   }
 
-  function generate(analysis, options) {
-    const opts = options || {};
-    const keyCount = opts.keyCount || 4;
-    const level = DIFFICULTIES[opts.difficulty] || DIFFICULTIES.normal;
-    const rng = mulberry32(Math.round((analysis.duration || 1) * 1000) + keyCount * 7919);
+  /**
+   * 乐句重复：在音乐重复的小节里，沿用「第一次出现」那个小节的节奏型。
+   *
+   * 人排谱在重复段会复用同一套音型，机械生成每小节独立决定就会显得散。
+   * 做法是取交集：只保留「源小节也有」的十六分位置——
+   * 时间用本小节自己的起音时刻（精度不丢），不一致的音符丢掉。
+   */
+  function applyBarRepeats(events, analysis, offset, beatMs) {
+    const bars = analysis.bars;
+    if (!bars || !bars.groups) return events;
+    const barMs = beatMs * 4;
+    const step = beatMs / 4;
 
-    const beatMs = analysis.beatMs;
-    const offset = analysis.offset;
-    const stepMs = beatMs / level.stepsPerBeat;
-
-    // 1) 吸附到网格：同一个格子可能同时有多个来源（底鼓 / 军鼓 / 镲 / 人声）
-    const slotMap = new Map();
-
-    // 人声倾向：中频上「拖得住」的起音更像人声/旋律，给它加权，
-    // 这样有人声的段落里音符会跟着人声走，而不是跟着底鼓走
-    const vocalBoost = function (o) {
-      if (o.band !== 'mid') return 1;
-      return sustainMs(analysis, o.time) >= beatMs * 0.4 ? 1.5 : 1;
-    };
-
-    for (let i = 0; i < analysis.onsets.length; i++) {
-      const o = analysis.onsets[i];
-      const weight = o.strength * vocalBoost(o);
-      if (weight < level.minStrength * 0.6) continue;
-      const rel = o.time - offset;
-      if (rel < 0) continue;
-      const slot = Math.round(rel / stepMs);
-      const target = offset + slot * stepMs;
-      // 容差收紧到 ±30ms 以内。
-      // 原来用 stepMs*0.45，简单难度下等于允许 90ms 的偏差 ——
-      // 那会把音挪到离真实发声很远的地方，听起来就是"对不上拍"。
-      const snapTol = Math.min(stepMs * 0.25, 30);
-      if (Math.abs(o.time - target) > snapTol) continue;
-
-      // 收集时门槛放宽一点：弱音可以当「和弦的第二个音」，
-      // 但决定它是不是一个音的主音时，仍然要求过 minStrength
-      // 段落强度：高潮段门槛更低（音符更多），间奏门槛更高
-      const intensity = hasSections(analysis) ? intensityAt(analysis, target) : 0.5;
-      const strengthFloor = level.minStrength * (1.12 - 0.4 * intensity);
-      if (weight < strengthFloor * 0.6) continue;
-
-      const item = { time: target, strength: weight, band: o.band, intensity: intensity };
-      const list = slotMap.get(slot);
-      if (list) list.push(item);
-      else slotMap.set(slot, [item]);
+    const byBar = new Map();
+    for (let i = 0; i < events.length; i++) {
+      const b = Math.floor((events[i].time - offset) / barMs + 1e-6);
+      if (!byBar.has(b)) byBar.set(b, []);
+      byBar.get(b).push(events[i]);
     }
 
-    // 2) 每个格子收集所有音源，按不同频段去重 → 决定这一刻要几个键
-    const rawEvents = [];
-    const chordOn = level.chordOnBeats || [0];
-    const maxChord = level.maxChord || 1;
+    const out = [];
+    // 注意要遍历**所有**小节（不是只遍历有事件的那些）：
+    // 声部选择可能把某个重复小节的音全筛掉，那样它就拿不到源小节的节奏，
+    // 同一段音乐两次出现的写法就不一样了。
+    for (let b = 0; b < bars.count; b++) {
+      const list = byBar.get(b) || [];
+      const src = bars.groups[b];
+      const srcList = (src !== b && src >= 0) ? byBar.get(src) : null;
 
-    Array.from(slotMap.keys()).sort(function (a, b) { return a - b; }).forEach(function (slot) {
-      const list = slotMap.get(slot).sort(function (a, b) { return b.strength - a.strength; });
-      const bands = [];
-      const picked = [];
-      for (let i = 0; i < list.length; i++) {
-        if (bands.indexOf(list[i].band) >= 0) continue; // 同频段视为同一个音源
-        bands.push(list[i].band);
-        picked.push(list[i]);
-      }
-      if (!picked.length) return;
-      const evIntensity = picked[0].intensity || 0.5;
-      const evFloor = level.minStrength * (1.12 - 0.4 * evIntensity);
-      if (picked[0].strength < evFloor) return; // 主音不够强，这一格不要
-
-      const time = offset + slot * stepMs;
-      // 小节内的第几拍（0 = 小节第一拍）。
-      // 用整数槽位算，不要用 (time-offset)/beat —— 那在十六分的正中间会
-      // 正好落在 x.5 上，四舍五入的方向会让前后判定漂移一拍。
-      const beatIdx = Math.floor(slot / level.stepsPerBeat) - (analysis.downbeat || 0);
-      const barBeat = ((beatIdx % 4) + 4) % 4;
-      const onChordBeat = chordOn.indexOf(barBeat) >= 0;
-
-      let chord = 1;
-      if (onChordBeat && picked.length >= 2) {
-        chord = Math.min(maxChord, picked.length);
-        // 第二个音也得够强，不然就是硬凑
-        const chordFloor = level.minStrength * (level.chordFactor || 1.2);
-        while (chord > 1 && picked[chord - 1].strength < chordFloor) chord--;
+      if (!srcList || !srcList.length) {
+        for (let i = 0; i < list.length; i++) out.push(list[i]);
+        continue;
       }
 
-      rawEvents.push({
-        time: time,
-        strength: picked[0].strength,
-        band: picked[0].band,
-        chord: chord,
-        intensity: evIntensity,
-        barBeat: barBeat,
-        onBeat: (slot % level.stepsPerBeat) === 0,
-        sub: slot % level.stepsPerBeat,
-      });
-    });
+      const srcStart = offset + src * barMs;
+      const barStart = offset + b * barMs;
 
-    // 3) 密度控制
-    const minGapMs = beatMs * level.minGapBeats;
-    const events = [];
-    for (let i = 0; i < rawEvents.length; i++) {
-      const ev = rawEvents[i];
-      const last = events[events.length - 1];
-      if (last) {
-        const midIntensity = ((ev.intensity || 0.5) + (last.intensity || 0.5)) / 2;
-        const effGap = minGapMs / (0.78 + 0.5 * midIntensity); // 高潮 1.28 倍密，间奏 0.78 倍
-        if (ev.time - last.time < effGap - 1) {
-          if (ev.strength > last.strength) events[events.length - 1] = ev;
-          continue;
-        }
-      }
-      events.push(ev);
-    }
-
-    // 3.5) 段落密度整形：每 2 拍一个窗口，按该处能量决定保留几个音。
-    //      「弱化门槛」对密度几乎无影响（起音数量是固定的），
-    //      真正能拉开高潮/间奏差距的是这一步。
-    {
-      const winMs = beatMs * 2;
-      const base = level.targetPerBeat || 2.4;
-      const buckets = new Map();
-      for (let i = 0; i < events.length; i++) {
-        const w = Math.floor((events[i].time - offset) / winMs);
-        if (!buckets.has(w)) buckets.set(w, []);
-        buckets.get(w).push(events[i]);
-      }
-
-      const kept = [];
-      buckets.forEach(function (list, w0) {
-        let sum = 0;
-        for (let i = 0; i < list.length; i++) sum += (list[i].intensity || 0.5);
-        const avgIntensity = sum / list.length;
-        // 段落起伏不明显时用中性强度，不要凭空压低或抬高密度
-        const intensity = hasSections(analysis)
-          ? sectionLevel(analysis, offset + (w0 + 0.5) * winMs)
-          : 0.5;
-        // 高潮(1.0) 约 1.3 倍，间奏(0.0) 约 0.55 倍
-        const cap = Math.max(1, Math.round(base * 2 * (0.55 + 0.75 * Math.max(intensity, avgIntensity))));
-
-        // 密度上限按段落走，但**不筛网格**：切分的鼓点必须留下来。
-        // 排序只给正拍一点点加权（同强度时优先正拍），不能盖过起音本身的强弱——
-        // 否则谱面会变成「整整齐齐全在正拍上」，跟音乐脱节。
-        const downWeight = 1.30 + 0.30 * intensity;  // 小节第一拍：1.30 ~ 1.60
-        const beatWeight = 1.12 + 0.18 * intensity;  // 其它正拍：1.12 ~ 1.30
-        const rank = function (ev) {
-          if (!ev.onBeat) return ev.strength;
-          return ev.strength * (ev.barBeat === 0 ? downWeight : beatWeight);
-        };
-
-        list.sort(function (a, b) { return rank(b) - rank(a); });
-
-        const take = list.slice(0, cap);
-
-        // 小节第一拍保底：这一窗口里拍了第一拍（起音足够强）但被挤掉了，
-        // 就用它换掉窗口里最弱的那个音。加权解决不了这个问题——
-        // 下拍本来就是最强的，被挤掉的往往是弱拍；能拉开差距的是「保证有」。
-        const downCand = list.filter(function (e) { return e.onBeat && e.barBeat === 0; });
-        if (downCand.length) {
-          let hasDown = false;
-          for (let i = 0; i < take.length; i++) {
-            if (take[i].onBeat && take[i].barBeat === 0) { hasDown = true; break; }
-          }
-          if (!hasDown) {
-            downCand.sort(function (a, b) { return b.strength - a.strength; });
-            let weakIdx = -1;
-            let weakVal = Infinity;
-            for (let i = 0; i < take.length; i++) {
-              if (take[i].onBeat && take[i].barBeat === 0) continue;
-              const v = take[i].strength * (take[i].onBeat ? 1.15 : 1);
-              if (v < weakVal) { weakVal = v; weakIdx = i; }
-            }
-            if (weakIdx >= 0) take[weakIdx] = downCand[0];
-          }
-        }
-
-        take.sort(function (a, b) { return a.time - b.time; });
-        for (let i = 0; i < take.length; i++) kept.push(take[i]);
-      });
-
-      kept.sort(function (a, b) { return a.time - b.time; });
-      events.length = 0;
-      for (let i = 0; i < kept.length; i++) events.push(kept[i]);
-    }
-
-    // 4) 分配轨道：连续音走「音型模板」，孤立音按均衡挑选
-    const notes = [];
-    const lastUse = new Float64Array(keyCount).fill(-1e9);
-    const usage = new Float64Array(keyCount);
-    let assigned = 0;
-    let lastCol = -1;
-
-    const runGapMs = beatMs * (level.runGapBeats || 0.62);
-    const usageShare = function (c) { return assigned > 0 ? usage[c] / assigned : 0; };
-
-    // 一个事件可能落成 2~3 个键：主音按音型走，副音镜像到另一侧
-    const pushNote = function (ev, primaryCol) {
-      const cols = [primaryCol];
-      for (let k = 1; k < (ev.chord || 1); k++) {
-        const mirror = keyCount - 1 - cols[cols.length - 1];
-        const order = [mirror, (mirror + 1) % keyCount, (mirror + keyCount - 1) % keyCount];
-        for (let m = 0; m < order.length; m++) {
-          const c = order[m];
-          if (cols.indexOf(c) >= 0) continue;
-          if (ev.time - lastUse[c] < 90) continue;
-          cols.push(c);
-          break;
-        }
-      }
-
-      for (let k = 0; k < cols.length; k++) {
-        const c = cols[k];
-        lastUse[c] = ev.time;
-        usage[c] += 1;
-        assigned++;
-        notes.push({
-          col: c,
-          time: Math.round(ev.time),
-          end: null,
-          isHold: false,
-          strength: ev.strength,
-          band: ev.band,
+      // ① 先铺源小节的节奏（平移过来）——这是「重复段听起来一样」的来源
+      const usedCls = {};
+      for (let i = 0; i < srcList.length; i++) {
+        const e = srcList[i];
+        const t = barStart + (e.time - srcStart);
+        usedCls[Math.round((e.time - srcStart) / step)] = true;
+        out.push({
+          time: t,
+          strength: e.strength,
+          band: e.band,
+          chord: e.chord,
+          intensity: e.intensity,
+          barBeat: e.barBeat,
+          onBeat: e.onBeat,
+          sub: e.sub,
+          copied: true,
         });
       }
-      lastCol = primaryCol;
-    };
 
-    const pickSingle = function (ev, orderly) {
-      const bias = bandBias(ev.band, keyCount);
-      let bestCol = 0;
-      let bestScore = -1e9;
-      for (let c = 0; c < keyCount; c++) {
-        let score = rng() * (orderly ? 0.05 : 0.3);
-        if (bias) score += bias[c];
-        score -= usageShare(c) * 2.2;
-        const gap = ev.time - lastUse[c];
-        if (gap < 95) score -= 3.5;
-        else if (gap < 180) score -= 1.2;
-        if (c === lastCol) score -= 1.5;
-        if (c === 0 || c === keyCount - 1) score += 0.12;
-        if (score > bestScore) { bestScore = score; bestCol = c; }
+      // ② 再补上本小节自己独有的重音。
+      //    只复制源节奏会削掉密度（实测 -10%），补重音既保住密度又不破坏一致性。
+      let localMax = 0;
+      for (let i = 0; i < list.length; i++) if (list[i].strength > localMax) localMax = list[i].strength;
+      for (let i = 0; i < list.length; i++) {
+        const e = list[i];
+        const c = Math.round((e.time - barStart) / step);
+        if (usedCls[c]) continue;
+        if (e.strength < localMax * 0.72) continue;
+        usedCls[c] = true;
+        out.push(e);
       }
-      return bestCol;
-    };
+    }
 
+    out.sort(function (a, b) { return a.time - b.time; });
+    return out;
+  }
 
-    /** 挑一组音型：优先用还没怎么用过的列 */
-    const pickPattern = function (len, orderly) {
-      const full = TEMPLATES[len] || TEMPLATES[3];
-      const allow = orderly ? (ORDERLY[len] || [0]) : null;
-      const bank = allow ? allow.map(function (i) { return full[i]; }) : full;
-      let best = null;
-      let bestScore = -1e9;
-      for (let t = 0; t < bank.length; t++) {
-        for (let rot = 0; rot < keyCount; rot++) {
-          const cols = bank[t].map(function (c) { return (c + rot) % keyCount; });
-          let score = rng() * (orderly ? 0.1 : 0.5);
-          for (let k = 0; k < cols.length; k++) score -= usageShare(cols[k]) * 1.6;
-          if (cols[0] === lastCol) score -= 2.0;
-          if (score > bestScore) { bestScore = score; best = cols; }
+  /* ---------------- 梅尔频谱（给采音时机模型用） ---------------- */
+  const MEL_NFFT = 1024;
+  const MEL_HOP = 256;
+  const MEL_BINS = 24;
+
+  function hannWindow(n) {
+    const w = new Float32Array(n);
+    for (let i = 0; i < n; i++) w[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (n - 1));
+    return w;
+  }
+
+  /** 原地基-2 FFT（长度必须是 2 的幂） */
+  function fftInPlace(re, im) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) {
+        let tmp = re[i]; re[i] = re[j]; re[j] = tmp;
+        tmp = im[i]; im[i] = im[j]; im[j] = tmp;
+      }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = -2 * Math.PI / len;
+      const wr = Math.cos(ang), wi = Math.sin(ang);
+      for (let i = 0; i < n; i += len) {
+        let cr = 1, ci = 0;
+        for (let k = 0; k < len / 2; k++) {
+          const ur = re[i + k], ui = im[i + k];
+          const vr = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci;
+          const vi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+          re[i + k] = ur + vr; im[i + k] = ui + vi;
+          re[i + k + len / 2] = ur - vr; im[i + k + len / 2] = ui - vi;
+          const ncr = cr * wr - ci * wi;
+          ci = cr * wi + ci * wr;
+          cr = ncr;
         }
       }
-      return best;
-    };
-
-    let ev = 0;
-    while (ev < events.length) {
-      let j = ev;
-      while (j + 1 < events.length && events[j + 1].time - events[j].time <= runGapMs) j++;
-      const len = j - ev + 1;
-
-      // 这一段有多「满」：高潮段让音型更规整，少一点随机
-      let iSum = 0;
-      for (let k = ev; k <= j; k++) iSum += (events[k].intensity || 0.5);
-      const orderly = (iSum / len) >= 0.55;
-
-      if (len === 1) {
-        pushNote(events[ev], pickSingle(events[ev], orderly));
-      } else if (len <= 4 && TEMPLATES[len]) {
-        const cols = pickPattern(len, orderly);
-        for (let k = 0; k < len; k++) pushNote(events[ev + k], cols[k]);
-      } else {
-        // 长串：挑一个音型，按「上行 / 下行」交替铺，
-        // 每轮把起点挪一列，听起来像刻意的楼梯而不是随机走位
-        const bank = TEMPLATES[4];
-        const pick = orderly ? [0, 1] : null; // 高潮段只在两条纯楼梯之间换
-        const tpl = pick ? bank[pick[Math.floor(rng() * pick.length)]] : bank[Math.floor(rng() * bank.length)];
-        let rot = Math.floor(rng() * keyCount);
-        let ascending = rng() < 0.5;
-        let k = 0;
-        while (k < len) {
-          const chunk = Math.min(4, len - k);
-          let seq;
-          if (chunk === 4) {
-            seq = tpl.map(function (c) { return (c + rot) % keyCount; });
-            if (!ascending) seq = seq.slice().reverse();
-          } else {
-            seq = tpl.slice(0, chunk).map(function (c) { return (c + rot) % keyCount; });
-          }
-          for (let m = 0; m < chunk; m++) pushNote(events[ev + k + m], seq[m]);
-          k += chunk;
-          ascending = !ascending;
-          if (ascending) rot = (rot + 1) % keyCount;
-        }
-      }
-      ev = j + 1;
     }
+  }
 
-    // 安全网：同列两个音不能挤在 90ms 内（手按不过来）
-    for (let n = 1; n < notes.length; n++) {
-      let guard = 0;
-      while (notes[n].col === notes[n - 1].col &&
-             notes[n].time - notes[n - 1].time < 90 && guard < keyCount) {
-        notes[n].col = (notes[n].col + 1) % keyCount;
-        guard++;
+  function melFilterbankJs(sr) {
+    const nBins = MEL_NFFT / 2 + 1;
+    const hz2m = function (h) { return 2595 * Math.log10(1 + h / 700); };
+    const m2hz = function (m) { return 700 * (Math.pow(10, m / 2595) - 1); };
+    const lo = hz2m(20), hi = hz2m(sr / 2);
+    const hz = [];
+    for (let i = 0; i < MEL_BINS + 2; i++) hz.push(m2hz(lo + (hi - lo) * i / (MEL_BINS + 1)));
+    const fb = [];
+    for (let i = 0; i < MEL_BINS; i++) {
+      const row = new Float32Array(nBins);
+      const l = hz[i], c = hz[i + 1], r = hz[i + 2];
+      for (let b = 0; b < nBins; b++) {
+        const fq = b * (sr / 2) / (nBins - 1);
+        const up = (fq - l) / Math.max(1e-9, c - l);
+        const dn = (r - fq) / Math.max(1e-9, r - c);
+        row[b] = Math.max(0, Math.min(up, dn));
+      }
+      fb.push(row);
+    }
+    return fb;
+  }
+
+  /** 返回 { data: Float32Array(frames*24), frames, rate } */
+  function computeMel(pcm, sr) {
+    const fb = melFilterbankJs(sr);
+    const win = hannWindow(MEL_NFFT);
+    const frames = Math.max(1, Math.floor((pcm.length - MEL_NFFT) / MEL_HOP) + 1);
+    const data = new Float32Array(frames * MEL_BINS);
+    const re = new Float32Array(MEL_NFFT);
+    const im = new Float32Array(MEL_NFFT);
+    const nBins = MEL_NFFT / 2 + 1;
+    const mag = new Float32Array(nBins);
+    for (let i = 0; i < frames; i++) {
+      const base = i * MEL_HOP;
+      for (let k = 0; k < MEL_NFFT; k++) {
+        const idx = base + k;
+        re[k] = (idx < pcm.length ? pcm[idx] : 0) * win[k];
+        im[k] = 0;
+      }
+      fftInPlace(re, im);
+      for (let b = 0; b < nBins; b++) mag[b] = Math.sqrt(re[b] * re[b] + im[b] * im[b]);
+      for (let m = 0; m < MEL_BINS; m++) {
+        const row = fb[m];
+        let s = 0;
+        for (let b = 0; b < nBins; b++) s += row[b] * mag[b];
+        data[i * MEL_BINS + m] = Math.log1p(100 * s);
       }
     }
+    return { data: data, frames: frames, rate: sr / MEL_HOP };
+  }
 
-    // 4) 长条：只在「这个音真的拖了足够久」的地方放，长度跟着延音走
-    //    如果它所在的列马上还有音，就换一条空着的列 —— 别让延音白白浪费
-    const timesByCol = [];
-    for (let c = 0; c < keyCount; c++) timesByCol.push([]);
-    for (let n = 0; n < notes.length; n++) timesByCol[notes[n].col].push(notes[n].time);
+  /** 用 238 维模型给候选打分（返回按概率排序的数组） */
 
-    const roomInColumn = function (c, t) {
-      const arr = timesByCol[c];
-      let lo = 0;
-      let hi = arr.length;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (arr[mid] <= t + 1) lo = mid + 1;
-        else hi = mid;
-      }
-      return lo < arr.length ? arr[lo] - t : Infinity;
+  /* 训练好的选点模型（逻辑回归，22 个权重）。
+   * 用 31 个人排 NM/HD 谱面训练，留一法验证：同密度下精确率 48.7%（规则生成器是 35.7%）。
+   * 权重由 .verify/tools/train.py 产出，改动特征时两边必须同步。 */
+  const MODEL = {
+    w: [-0.848597, -0.113622, 0.198645, 0.645167, -0.066534, -0.124255, -0.073294, 0.019568, -0.018239, 0.004994, -0.00631, 0.004829, -0.009846, 0.025229, -0.020189, 0.110473, -0.022996, 0.019755, -0.009354, 0.006147, -0.062701, -0.106791],
+    mu: [0.26561, 0.210547, 0.16222, 0.489262, 0.33728, 0.175643, 0.249686, 0.250378, 0.250305, 0.249631, 0.250141, 0.250414, 0.249431, 0.250014, 0.61162, -0.001532, 1.058123, 1.058123, 0.960438, 2.352999, 0.314311],
+    sd: [0.221484, 0.172748, 0.184531, 0.499885, 0.472781, 0.380517, 0.432831, 0.433231, 0.433189, 0.4328, 0.433094, 0.433252, 0.432684, 0.433021, 0.338963, 0.220818, 0.404244, 0.404244, 0.105735, 0.733089, 0.464241],
+    thresholds: { easy: 0.40, normal: 0.30, hard: 0.22 },
+  };
+
+  /**
+   * 给每个候选位置打分（模型预测「人会不会在这里放音符」）。
+   * 返回按概率排序的候选，调用方取前 N 个即可精确控制密度。
+   */
+  function modelCandidates(analysis, targetDensity) {
+    const beat = analysis.beatMs;
+    const offset = analysis.offset;
+    const step = beat / 4;
+    const bars = analysis.bars || {};
+    const groups = bars.groups || [];
+    const energy = analysis.energy || [];
+    const erate = analysis.frameRate || 172;
+    const onsets = analysis.onsets || [];
+    if (!onsets.length) return [];
+
+    const slotMap = new Map();
+    let modelCands = [];
+    for (let i = 0; i < onsets.length; i++) {
+      const o = onsets[i];
+      const k = Math.round((o.time - offset) / step);
+      if (k < 0) continue;
+      let e = slotMap.get(k);
+      if (!e) { e = { low: 0, mid: 0, high: 0, time: offset + k * step, onsetTime: o.time }; slotMap.set(k, e); }
+      else if (o.strength > Math.max(e.low, e.mid, e.high)) e.onsetTime = o.time;
+      if (o.strength > e[o.band]) e[o.band] = o.strength;
+    }
+    const slots = Array.from(slotMap.keys()).sort(function (a, b) { return a - b; });
+    if (!slots.length) return [];
+    const slotSet = new Set(slots);
+
+    const prevGap = new Map();
+    const nextGap = new Map();
+    let last = -1;
+    for (let i = 0; i < slots.length; i++) { prevGap.set(slots[i], last < 0 ? 8 : slots[i] - last); last = slots[i]; }
+    last = -1;
+    for (let i = slots.length - 1; i >= 0; i--) { nextGap.set(slots[i], last < 0 ? 8 : last - slots[i]); last = slots[i]; }
+
+    const barSlots = new Map();
+    const byBar = new Map();
+    for (let i = 0; i < slots.length; i++) {
+      const k = slots[i];
+      const b = Math.floor(k / 16);
+      barSlots.set(b, (barSlots.get(b) || 0) + 1);
+      if (!byBar.has(b)) byBar.set(b, []);
+      byBar.get(b).push(k);
+    }
+    const barMax = new Map();
+    const barRank = new Map();
+    byBar.forEach(function (ks, b) {
+      const vals = ks.map(function (k) {
+        const e = slotMap.get(k);
+        return { k: k, v: Math.max(e.low, e.mid, e.high) };
+      }).sort(function (x, y) { return y.v - x.v; });
+      barMax.set(b, vals.length ? vals[0].v : 1);
+      for (let i = 0; i < vals.length; i++) barRank.set(vals[i].k, i);
+    });
+
+    const out = [];
+    for (let i = 0; i < slots.length; i++) {
+      const k = slots[i];
+      const e = slotMap.get(k);
+      const low = e.low, mid = e.mid, high = e.high;
+      const mx = Math.max(low, mid, high);
+      if (mx <= 0) continue;
+      const cnt = (low > 0 ? 1 : 0) + (mid > 0 ? 1 : 0) + (high > 0 ? 1 : 0);
+      const sub = ((k % 4) + 4) % 4;
+      const barBeat = Math.floor(k / 4) % 4;
+      const bar = Math.floor(k / 16);
+      const t = e.time;
+      const ei = Math.max(0, Math.min(energy.length - 1, Math.round(t / 1000 * erate)));
+      const e0 = energy.length ? energy[ei] : 0.5;
+      const ei2 = Math.max(0, Math.min(energy.length - 1, Math.round((t - beat * 4) / 1000 * erate)));
+      const e1 = energy.length ? energy[ei2] : 0.5;
+      let dense = 0;
+      for (let j = Math.max(0, k - 8); j < k; j++) if (slotSet.has(j)) dense++;
+
+      const f = [
+        low, mid, high,
+        mx === low ? 1 : 0, mx === mid ? 1 : 0, mx === high ? 1 : 0,
+        sub === 0 ? 1 : 0, sub === 1 ? 1 : 0, sub === 2 ? 1 : 0, sub === 3 ? 1 : 0,
+        barBeat === 0 ? 1 : 0, barBeat === 1 ? 1 : 0, barBeat === 2 ? 1 : 0, barBeat === 3 ? 1 : 0,
+        e0, e0 - e1,
+        Math.min(prevGap.get(k), 8), Math.min(nextGap.get(k), 8),
+        dense / 8, cnt,
+        (bar < groups.length && groups[bar] === bar) ? 0 : 1,
+        mx / Math.max(1e-6, barMax.get(bar) || 1),
+        (barSlots.get(bar) || 0) / 16,
+        (barRank.get(k) || 0) / 16,
+        targetDensity,
+      ];
+      // 只循环模型真正用到的特征数（f 里的后几项是给以后扩展的，权重里没有）
+      let z = MODEL.w[0];
+      const nf = MODEL.mu.length;
+      for (let d = 0; d < nf; d++) z += MODEL.w[d + 1] * ((f[d] - MODEL.mu[d]) / MODEL.sd[d]);
+      out.push({ k: k, time: t, onsetTime: e.onsetTime, prob: 1 / (1 + Math.exp(-z)), low: low, mid: mid, high: high });
+    }
+    out.sort(function (a, b) { return b.prob - a.prob; });
+    return out;
+  }
+
+  /**
+   * 分段选声部。
+   *
+   * 实测 31 个人排 NM/HD 谱面：音符有 97% 落在真实起音上，
+   * 但**只用掉了 15% 的起音**；而且 96% 的 4 小节段落存在明确的主导频段。
+   * 也就是说人排谱不是「谁响采谁」，而是每段挑一两个声部来写。
+   *
+   * 这里给每个段落算出允许的频段集合，后面的收集阶段只采这些频段。
+   */
+  function pickVoices(onsetList, analysis, offset, beatMs) {
+    const secMs = beatMs * 4 * 4;            // 4 小节一段
+    const secOf = function (t) {
+      return Math.floor((t - offset) / secMs + 1e-6);
     };
 
-    const columnBusyNear = function (c, t, windowMs) {
-      const arr = timesByCol[c];
-      const w = windowMs || 120;
-      for (let i = 0; i < arr.length; i++) {
-        if (Math.abs(arr[i] - t) < w) return true;
-      }
-      return false;
-    };
-
-    const moveNote = function (note, from, to) {
-      const arr = timesByCol[from];
-      const idx = arr.indexOf(note.time);
-      if (idx >= 0) arr.splice(idx, 1);
-      const dst = timesByCol[to];
-      let at = 0;
-      while (at < dst.length && dst[at] < note.time) at++;
-      dst.splice(at, 0, note.time);
-      note.col = to;
-    };
-
-    // 每条列上「已经有长条按到什么时候」——挪位置时必须避开
-    const holdEndByCol = new Float64Array(keyCount).fill(-1e9);
-
-    // 长条密度上限：
-    //   - 总量不超过 12%（人声吟唱那种整段长音，否则会变成一片长条）
-    //   - 两条长条之间至少隔 1.5 拍
-    let holdCount = 0;
-    const holdCap = Math.max(1, Math.floor(notes.length * 0.12));
-    const holdGapMs = beatMs * 1.5;
-    let lastHoldEnd = -1e9;
-
-    for (let n = 0; n < notes.length && holdCount < holdCap; n++) {
-      const note = notes[n];
-      if (note.time - lastHoldEnd < holdGapMs) continue;
-
-      const sustain = sustainMs(analysis, note.time);
-      if (sustain < beatMs * 0.85) continue;
-
-      const wanted = Math.min(beatMs * 2, sustain * 0.9);
-      if (wanted < beatMs * 0.7) continue;
-
-      let col = note.col;
-      let room = roomInColumn(col, note.time) - beatMs * 0.4;
-      if (note.time < holdEndByCol[col] + beatMs * 0.15) room = 0;
-      if (Math.min(wanted, room) < beatMs * 0.7) {
-        // 换一条能放下这条长条的列
-        let bestCol = -1;
-        let bestRoom = -1;
-        for (let c = 0; c < keyCount; c++) {
-          if (c === col) continue;
-          if (note.time < holdEndByCol[c] + beatMs * 0.15) continue;
-          if (columnBusyNear(c, note.time, 150)) continue;
-          const r = roomInColumn(c, note.time) - beatMs * 0.4;
-          if (r > bestRoom) { bestRoom = r; bestCol = c; }
-        }
-        if (bestCol < 0 || Math.min(wanted, bestRoom) < beatMs * 0.7) continue;
-        moveNote(note, col, bestCol);
-        col = bestCol;
-        room = bestRoom;
-      }
-
-      const len = Math.min(wanted, room);
-      note.isHold = true;
-      note.end = Math.round(note.time + len);
-      holdEndByCol[col] = note.end;
-      lastHoldEnd = note.end;
-      holdCount++;
+    // 每段的频段强度合计
+    const secs = new Map();
+    for (let i = 0; i < onsetList.length; i++) {
+      const o = onsetList[i];
+      const s = secOf(o.time);
+      if (!secs.has(s)) secs.set(s, { low: 0, mid: 0, high: 0, n: 0 });
+      const v = secs.get(s);
+      v[o.band] = (v[o.band] || 0) + o.strength;
+      v.n++;
     }
 
-    for (let n = 0; n < notes.length; n++) {
-      delete notes[n].nextCol;
-      delete notes[n].band;
-      notes[n].id = n;
-    }
+    const allow = new Map();
+    const groups = analysis.bars && analysis.bars.groups;
+    secs.forEach(function (v, s) {
+      const arr = [['low', v.low], ['mid', v.mid], ['high', v.high]].sort(function (a, b) { return b[1] - a[1]; });
+      const top = arr[0];
+      const second = arr[1];
+      const list = [top[0]];
+      // 第二声部接近的话一起允许（人排谱也常写两层）
+      if (top[1] > 0 && second[1] >= top[1] * 0.55) list.push(second[0]);
+      // 该段起音太少时放宽，避免整段没音符
+      if (v.n < 12) list.push('low', 'mid', 'high');
+      // 这一段是重复段的话，直接沿用「首次出现」那一段的选择，
+      // 否则同样的音乐在两次出现时会挑不同声部，重复感就没了
+      let key = s;
+      if (groups) {
+        const bar = s * 4;
+        const rep = groups[bar];
+        if (rep !== undefined && rep >= 0 && rep !== bar) key = Math.floor(rep / 4);
+      }
+      allow.set(s, { list: list, key: key });
+    });
 
-    const chart = {
-      keyCount: keyCount,
-      notes: notes,
-      meta: {
-        title: opts.title || '自动生成',
-        artist: opts.artist || '',
-        version: (opts.difficulty || 'normal').toUpperCase() + ' (Auto)',
-        creator: 'Rhythm4K 自动生成',
+    // 先按 key 归一：同一个 key 的段落合并成一个选择（取第一个出现的那段的列表）
+    const byKey = new Map();
+    allow.forEach(function (v, s) {
+      if (!byKey.has(v.key)) byKey.set(v.key, v.list);
+      else v.list = byKey.get(v.key);
+    });
+
+    return {
+      secOf: secOf,
+      allows: function (t) {
+        const s = secOf(t);
+        const v = allow.get(s);
+        return v ? v.list : ['low', 'mid', 'high'];
       },
-      difficulty: { OverallDifficulty: '8' },
-      timing: [{ time: offset, beatLength: beatMs, meter: 4, uninherited: true }],
-      audioFilename: opts.audioFilename || '',
-      background: '',
-      video: '',
-      videoStart: 0,
-      events: [],
-      mode: 3,
-      auto: {
-        bpm: Math.round(analysis.bpm * 10) / 10,
-        offset: Math.round(offset),
-        difficulty: opts.difficulty || 'normal',
-      },
     };
-    return chart;
   }
 
   /**
@@ -1048,8 +2017,34 @@
     return L.join('\n');
   }
 
+  /**
+   * 以 bpmHint 为起点做精细拟合 + 吸附。
+   * 用于「本地服务定层级、浏览器定精度」的组合。
+   */
+  function refineBpm(analysis, bpmHint) {
+    const onsets = (analysis && analysis.onsets) || [];
+    if (!onsets.length || !(bpmHint > 0)) return null;
+    // 本地服务擅长「拍子层级」，精度差；浏览器候选里 88% 含正确值。
+    // 所以不重新搜，而是「从候选里挑最接近服务值的那一个」，再做整数吸附。
+    const cands = (analysis.tempoCandidates || []).map(function (c) { return c.bpm; });
+    let pick = bpmHint;
+    if (cands.length) {
+      let bestD = Infinity;
+      for (let i = 0; i < cands.length; i++) {
+        const v = cands[i];
+        const d = Math.abs(Math.log(v / bpmHint));
+        if (d < bestD) { bestD = d; pick = v; }
+      }
+      if (bestD > 0.08) pick = bpmHint;   // 候选都不像，就用服务值
+    }
+    const fit = fitTempoGrid(onsets, pick, 28, 0.02);
+    if (!fit || !(fit.q > 0.15)) return null;
+    return { bpm: fit.bpm, offsetMs: fit.phaseMs, q: fit.q, snapped: fit.snapped, fromCand: pick };
+  }
+
   return {
     analyze: analyze,
+    refineBpm: refineBpm,
     report: report,
     generate: generate,
     toOsu: toOsu,
