@@ -1,4 +1,4 @@
-# 构建产物
+﻿# 构建产物
 dist/
 *.zip
 launcher/Rhythm4K.exe
@@ -20,3 +20,6 @@ node_modules/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# 开发时的代码快照（只在本地有意义）
+.backup/
