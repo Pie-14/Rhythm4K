@@ -62,7 +62,7 @@
         <dl id="readyStats" class="stats"></dl>
 
         <div class="settings">
-          <label>判定偏移 <input id="setOffset" type="number" step="1" min="-500" max="500"> ms</label>
+          <label>音频偏移 <input id="setOffset" type="number" step="1" min="-500" max="500"> ms</label>
           <label>音符下落时长 <input id="setScroll" type="number" step="50" min="300" max="1600"> ms</label>
           <label>背景暗度 <input id="setDim" type="range" min="0" max="95"></label>
           <label>音乐音量 <input id="setVolume" type="range" min="0" max="100"></label>
@@ -70,7 +70,7 @@
           <label class="chk"><input id="setAuto" type="checkbox"> 自动演奏（试听，每个音符带击打音）</label>
           <button id="btnCalib" class="btn">延迟校准…</button>
         </div>
-        <p class="hint">偏移：判定偏早调负、偏晚调正；通常 0 附近。改完自动保存。</p>
+        <p class="hint">音频偏移：音乐比谱面晚出现就调正，早出现调负；通常 0 附近。只影响声音，不动音符和判定。</p>
 
         <div id="autoRow" class="settings hidden">
           <label>自动谱面难度

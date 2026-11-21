@@ -48,8 +48,13 @@
       if (this.gain) this.gain.gain.value = this.volume;
     }
 
-    /** 从 buffer 的 offsetSec 处开始播放 */
-    play(buffer, offsetSec) {
+    /**
+     * 从 buffer 的 offsetSec 处开始播放。
+     * delayMs > 0 表示音乐比谱面时钟晚出声（负值则提前）。
+     * 注意：延迟只作用在音频上，谱面时钟（now）仍从 t0 起算——
+     * 这样音符/判定始终严格同步，被微调的是「听到的音乐」。
+     */
+    play(buffer, offsetSec, delayMs) {
       const ctx = this.ctx;
       this.stop();
       this.buffer = buffer;
@@ -62,7 +67,10 @@
       this._refreshLatency();
 
       const t0 = ctx.currentTime + PREROLL;
-      src.start(t0, this.baseOffset);
+      const shift = (delayMs || 0) / 1000;
+      // 提前出声时不能早于当前时刻
+      const startAt = Math.max(ctx.currentTime + 0.001, t0 + shift);
+      src.start(startAt, this.baseOffset);
       this.source = src;
       this.startedAt = t0;
       this.playing = true;

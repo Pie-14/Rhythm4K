@@ -8,6 +8,8 @@
   const $ = function (id) { return document.getElementById(id); };
 
   const STORE_KEY = 'rhythm4k.settings.v2';
+  // 设置结构版本：改了「判定偏移」的语义就要 +1，老存档里算坏的值会被清掉
+  const SETTINGS_VERSION = 3;
   const DEFAULTS = { offset: 0, scroll: 700, volume: 85, dim: 55, orientation: 'auto', autoPlay: false, sfxVolume: 130, bpmOverride: 0, useLocalBeats: false, beatServer: 'http://127.0.0.1:8737' };
   const SCREENS = ['menu', 'ready', 'pause', 'results', 'loading', 'calib'];
 
@@ -34,12 +36,22 @@
    * 设置
    * ------------------------------------------------------------------ */
   function loadSettings() {
+    let s;
     try {
       const raw = localStorage.getItem(STORE_KEY);
-      return Object.assign({}, DEFAULTS, raw ? JSON.parse(raw) : {});
-    } catch (e) {
+      s = Object.assign({}, DEFAULTS, raw ? JSON.parse(raw) : {});
+    } catch (err) {
       return Object.assign({}, DEFAULTS);
     }
+    // v3 之前：校准公式是「旧值 - 偏差」，多次校准会累积成 -450 这种离谱值。
+    // 而且那时候偏移同时挪音符和判定，玩家靠视觉补偿了；现在只作用于判定，
+    // 留着这个坏值会让所有按键都判早半拍（全 MISS）。所以直接清零。
+    if ((s.settingsVersion || 1) < 3) {
+      s.offset = 0;
+      s.settingsVersion = 3;
+    }
+    s.settingsVersion = SETTINGS_VERSION;
+    return s;
   }
 
   function saveSettings() {
@@ -737,7 +749,7 @@
 
     show(null);
     app.state = 'playing';
-    app.audio.play(app.audioBuffer, 0);
+    app.audio.play(app.audioBuffer, 0, app.settings.offset);   // 偏移只作用于音频
   }
 
   async function pause() {
@@ -947,11 +959,10 @@
 
     if (app.state === 'playing') {
       // 自动演奏时忽略判定偏移，否则击打音会和人听到的音乐错位
-      // 判定用时间（含判定偏移）；画面用时间不含偏移——
-      // 否则调偏移时音符和判定一起动，主观上几乎感觉不到变化。
-      const songRaw = app.audio.now();
-      const song = songRaw + (app.settings.autoPlay ? 0 : app.settings.offset);
-      app.lastFrame = { perf: now, song: songRaw, judge: song };
+      // 判定偏移同时作用于画面与判定：玩家照着画面打，两者必须一起动
+      // 谱面时钟不含偏移：音符位置与判定永远一致，被微调的是音频出声时间
+      const song = app.audio.now();
+      app.lastFrame = { perf: now, song: song };
 
       autoPlayStep(song);
       const events = app.engine.update(song);
@@ -960,10 +971,10 @@
         else if (events[i].type === 'holdbreak') app.renderer.flash(M4K.JUDGEMENTS.miss);
       }
 
-      syncVideo(songRaw);   // 视频跟画面时间，不受判定偏移影响
+      syncVideo(song);
       if (app.media.flv) {
         const p = app.media.flv;
-        p.update(songRaw - (app.chart.videoStart || 0));
+        p.update(song - (app.chart.videoStart || 0));
         if (p.failed) {
           fallbackToImage();
         } else if (!p.canvas || p.canvas.width === 0) {
@@ -1111,13 +1122,13 @@
     // 直接把「应用后会变成多少」写出来：
     // 用户看到偏差 +40，而设置里变成 -40（旧值减偏差），很容易以为没生效。
     const before = app.settings.offset;
-    // 偏差是绝对值（不随上一次设置累加），直接取相反数
+    // 偏差是绝对值（不随上一次设置累加）：玩家晚了 224ms，就把音乐提前 224ms
     const raw = Math.round(-r.offset);
     const after = clampOffset(raw);
     let text = '平均偏差 ' + sign + Math.round(r.offset) + ' ms（波动 ' + Math.round(r.spread) + ' ms）'
-      + '\n应用后判定偏移：' + before + ' → ' + after + ' ms'
+      + '\n应用后音频偏移：' + before + ' → ' + after + ' ms'
       + (raw !== after ? '（需 ' + raw + ' ms，超出 ±500 已截断）' : '')
-      + '\n判定偏移只影响判定时机，不会挪动音符';
+      + '\n音频偏移只移动音乐，不动音符和判定';
     if (r.spread > 70) text += '\n波动偏大，建议重来一次';
     if (Math.abs(r.offset) > 250) {
       text += '\n偏差异常大——先确认没有戴着蓝牙耳机，或者上一轮的提示音还在响';
@@ -1151,9 +1162,9 @@
     const hint = $('readyMeta');
     if (hint) {
       const was = hint.textContent;
-      hint.textContent = was + '　|　已应用判定偏移 ' + next + ' ms（原 ' + before + '）';
+      hint.textContent = was + '　|　已应用音频偏移 ' + next + ' ms（原 ' + before + '）';
       setTimeout(function () {
-        if (hint.textContent.indexOf('已应用判定偏移') >= 0) hint.textContent = was;
+        if (hint.textContent.indexOf('已应用音频偏移') >= 0) hint.textContent = was;
       }, 6000);
     }
   }
@@ -1266,7 +1277,7 @@
   function judgeTimeForEvent(timeStamp) {
     const lf = app.lastFrame;
     if (!lf) return app.audio.now() + app.settings.offset;
-    return (lf.judge != null ? lf.judge : lf.song) + (timeStamp - lf.perf);
+    return lf.song + (timeStamp - lf.perf);
   }
 
   function onKeyDown(e) {

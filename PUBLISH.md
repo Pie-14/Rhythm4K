@@ -48,6 +48,13 @@ git remote add origin https://github.com/<你的用户名>/<仓库名>.git
 git push -u origin main
 ```
 
+## 关于内置示例曲
+
+- **分发包（release zip）里带** `www/audio/demo.mp3` 和 `demo.jpg`，所以点「内置示例曲」能直接跑
+- **仓库里不带**（`.gitignore` 忽略了 `www/audio/`，第三方作品的版权问题）
+
+想生成不带音频的干净包：`package.ps1 -Public`。
+
 ## 发布 Release
 
 推上去之后，在仓库页面 `Releases → Draft a new release`：
